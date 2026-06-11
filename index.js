@@ -14,7 +14,7 @@ const { authRequired, signToken, JWT_SECRET } = require("./middleware/auth");
 
 const app = express();
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "*";
-const MONGO_URI = process.env.MONGO_URI;
+const MONGO_URI = process.env.MONGO_URI || "mongodb://localhost:27017/syncwave";
 
 app.use(cors({ origin: CLIENT_ORIGIN === "*" ? "*" : CLIENT_ORIGIN.split(","), credentials: true }));
 app.use(express.json({ limit: "1mb" }));
@@ -199,11 +199,16 @@ function getOrCreateSession(accountId) {
       state: {
         currentSong: null,
         isPlaying: false,
-        position: 0,
-        positionTimestamp: Date.now(),
+        positionAtStart: 0,
+        startedAt: null,
         volume: 80,
         queue: [],
         syncEnabled: true,
+        hostDeviceId: null,
+        hostDeviceName: "",
+        version: 0,
+        lastActionId: null,
+        lastAction: "",
       },
       devices: {},
       typing: {},
@@ -214,23 +219,56 @@ function getOrCreateSession(accountId) {
 
 function getLivePosition(session) {
   const s = session.state;
-  if (!s.isPlaying || !s.currentSong) return s.position;
-  const elapsed = (Date.now() - s.positionTimestamp) / 1000;
-  return Math.min(s.position + elapsed, s.currentSong.duration || 9999);
+  if (!s.isPlaying || !s.currentSong || !s.startedAt) return s.positionAtStart || 0;
+  const elapsed = (Date.now() - s.startedAt) / 1000;
+  return Math.min((s.positionAtStart || 0) + elapsed, s.currentSong.duration || 9999);
 }
 
 function statePayload(session) {
   return {
     ...session.state,
     position: getLivePosition(session),
+    serverTime: Date.now(),
     devices: Object.values(session.devices),
   };
 }
 
-function emitState(accountId) {
+function nextActionId(deviceId, action) {
+  return `${deviceId || "device"}:${action}:${Date.now()}:${Math.random().toString(16).slice(2)}`;
+}
+
+function debugSync(deviceName, event, details = {}) {
+  console.log(`[${deviceName || "Unknown Device"}] ${event}`, details);
+}
+
+function markAction(session, deviceId, deviceName, action) {
+  session.state.version += 1;
+  session.state.lastAction = action;
+  session.state.lastActionId = nextActionId(deviceId, action);
+  session.state.hostDeviceId = deviceId;
+  session.state.hostDeviceName = deviceName;
+}
+
+function canControl(session, deviceId) {
+  return !session.state.hostDeviceId || session.state.hostDeviceId === deviceId;
+}
+
+function rejectNonHost(socket, session, action, deviceName) {
+  debugSync(deviceName, `${action}_REJECTED_NON_HOST`, {
+    hostDeviceName: session.state.hostDeviceName,
+  });
+  socket.emit("control_rejected", {
+    action,
+    hostDeviceId: session.state.hostDeviceId,
+    hostDeviceName: session.state.hostDeviceName,
+  });
+}
+
+function emitState(accountId, targetSocket = null) {
   const session = sessions[accountId];
   if (!session) return;
-  io.to(accountId).emit("state_update", statePayload(session));
+  const target = targetSocket ? io.to(targetSocket) : io.to(accountId);
+  target.emit("state_update", statePayload(session));
 }
 
 function emitDeviceEvent(accountId, type, deviceName) {
@@ -331,7 +369,7 @@ io.on("connection", (socket) => {
 
       socket.join(currentAccountId);
       ack?.({ ok: true });
-      socket.emit("state_update", statePayload(session));
+      debugSync(currentDeviceName, "PLAYER_JOINED", { deviceId: currentDeviceId });
 
       const messages = await Message.find({ accountId: currentAccountId }).sort({ timestamp: -1 }).limit(80).lean();
       socket.emit("messages_history", messages.reverse());
@@ -346,80 +384,114 @@ io.on("connection", (socket) => {
   socket.on("play_song", ({ song }) => {
     if (!currentAccountId || !song) return;
     const session = sessions[currentAccountId];
+    debugSync(currentDeviceName, "PLAY_RECEIVED", { song: song.title });
     session.state.currentSong = song;
     session.state.isPlaying = true;
-    session.state.position = 0;
-    session.state.positionTimestamp = Date.now();
+    session.state.positionAtStart = 0;
+    session.state.startedAt = Date.now();
+    markAction(session, currentDeviceId, currentDeviceName, "SONG_CHANGE");
     if (!session.state.queue.find((s) => s.id === song.id)) {
       session.state.queue = [song, ...session.state.queue].slice(0, 100);
     }
     if (session.state.syncEnabled) emitState(currentAccountId);
+    else emitState(currentAccountId, socket.id);
   });
 
   socket.on("play_pause", ({ isPlaying }) => {
     if (!currentAccountId) return;
     const session = sessions[currentAccountId];
+    if (!canControl(session, currentDeviceId)) return rejectNonHost(socket, session, "PLAY_PAUSE", currentDeviceName);
     const livePos = getLivePosition(session);
+    debugSync(currentDeviceName, isPlaying ? "PLAY_RECEIVED" : "PAUSE_RECEIVED", { position: livePos });
     session.state.isPlaying = Boolean(isPlaying);
-    session.state.position = livePos;
-    session.state.positionTimestamp = Date.now();
+    session.state.positionAtStart = livePos;
+    session.state.startedAt = session.state.isPlaying ? Date.now() : null;
+    markAction(session, currentDeviceId, currentDeviceName, session.state.isPlaying ? "PLAY" : "PAUSE");
     if (session.state.syncEnabled) emitState(currentAccountId);
+    else emitState(currentAccountId, socket.id);
   });
 
   socket.on("seek", ({ position }) => {
     if (!currentAccountId) return;
     const session = sessions[currentAccountId];
-    session.state.position = Math.max(0, Number(position) || 0);
-    session.state.positionTimestamp = Date.now();
+    if (!canControl(session, currentDeviceId)) return rejectNonHost(socket, session, "SEEK", currentDeviceName);
+    const nextPosition = Math.max(0, Number(position) || 0);
+    debugSync(currentDeviceName, "SEEK_RECEIVED", { position: nextPosition });
+    session.state.positionAtStart = nextPosition;
+    session.state.startedAt = session.state.isPlaying ? Date.now() : null;
+    markAction(session, currentDeviceId, currentDeviceName, "SEEK");
     if (session.state.syncEnabled) emitState(currentAccountId);
+    else emitState(currentAccountId, socket.id);
   });
 
   socket.on("next_song", () => {
     if (!currentAccountId) return;
     const session = sessions[currentAccountId];
+    if (!canControl(session, currentDeviceId)) return rejectNonHost(socket, session, "NEXT", currentDeviceName);
     if (!session.state.queue.length) return;
     const idx = session.state.queue.findIndex((s) => s.id === session.state.currentSong?.id);
     const next = session.state.queue[(idx + 1) % session.state.queue.length];
     if (!next) return;
+    debugSync(currentDeviceName, "NEXT_RECEIVED", { song: next.title });
     session.state.currentSong = next;
     session.state.isPlaying = true;
-    session.state.position = 0;
-    session.state.positionTimestamp = Date.now();
+    session.state.positionAtStart = 0;
+    session.state.startedAt = Date.now();
+    markAction(session, currentDeviceId, currentDeviceName, "NEXT");
     if (session.state.syncEnabled) emitState(currentAccountId);
+    else emitState(currentAccountId, socket.id);
   });
 
   socket.on("prev_song", () => {
     if (!currentAccountId) return;
     const session = sessions[currentAccountId];
+    if (!canControl(session, currentDeviceId)) return rejectNonHost(socket, session, "PREV", currentDeviceName);
     if (!session.state.queue.length) return;
     const idx = session.state.queue.findIndex((s) => s.id === session.state.currentSong?.id);
     const prev = session.state.queue[(idx - 1 + session.state.queue.length) % session.state.queue.length];
     if (!prev) return;
+    debugSync(currentDeviceName, "PREV_RECEIVED", { song: prev.title });
     session.state.currentSong = prev;
     session.state.isPlaying = true;
-    session.state.position = 0;
-    session.state.positionTimestamp = Date.now();
+    session.state.positionAtStart = 0;
+    session.state.startedAt = Date.now();
+    markAction(session, currentDeviceId, currentDeviceName, "PREV");
     if (session.state.syncEnabled) emitState(currentAccountId);
+    else emitState(currentAccountId, socket.id);
   });
 
   socket.on("set_queue", ({ queue }) => {
     if (!currentAccountId || !Array.isArray(queue)) return;
     const session = sessions[currentAccountId];
+    debugSync(currentDeviceName, "QUEUE_RECEIVED", { count: queue.length });
     session.state.queue = queue.filter(Boolean).slice(0, 100);
+    session.state.version += 1;
+    session.state.lastAction = "QUEUE";
+    session.state.lastActionId = nextActionId(currentDeviceId, "QUEUE");
     if (session.state.syncEnabled) emitState(currentAccountId);
+    else emitState(currentAccountId, socket.id);
   });
 
   socket.on("volume_change", ({ volume }) => {
     if (!currentAccountId) return;
     const session = sessions[currentAccountId];
+    debugSync(currentDeviceName, "VOLUME_RECEIVED", { volume });
     session.state.volume = Math.max(0, Math.min(100, Number(volume) || 0));
+    session.state.version += 1;
+    session.state.lastAction = "VOLUME";
+    session.state.lastActionId = nextActionId(currentDeviceId, "VOLUME");
     if (session.state.syncEnabled) emitState(currentAccountId);
+    else emitState(currentAccountId, socket.id);
   });
 
   socket.on("toggle_sync", ({ syncEnabled }) => {
     if (!currentAccountId) return;
     const session = sessions[currentAccountId];
+    debugSync(currentDeviceName, "SYNC_TOGGLE_RECEIVED", { syncEnabled });
     session.state.syncEnabled = Boolean(syncEnabled);
+    session.state.version += 1;
+    session.state.lastAction = "SYNC_TOGGLE";
+    session.state.lastActionId = nextActionId(currentDeviceId, "SYNC_TOGGLE");
     emitState(currentAccountId);
   });
 
@@ -450,8 +522,19 @@ io.on("connection", (socket) => {
 
   socket.on("disconnect", async () => {
     if (!currentAccountId || !currentDeviceId || !sessions[currentAccountId]) return;
+    const session = sessions[currentAccountId];
     delete sessions[currentAccountId].devices[currentDeviceId];
     delete sessions[currentAccountId].typing[currentDeviceId];
+    if (session.state.hostDeviceId === currentDeviceId) {
+      debugSync(currentDeviceName, "HOST_DISCONNECTED");
+      session.state.hostDeviceId = null;
+      session.state.hostDeviceName = "";
+      session.state.positionAtStart = getLivePosition(session);
+      session.state.startedAt = session.state.isPlaying ? Date.now() : null;
+      session.state.version += 1;
+      session.state.lastAction = "HOST_DISCONNECT";
+      session.state.lastActionId = nextActionId(currentDeviceId, "HOST_DISCONNECT");
+    }
     await markDeviceOffline(currentAccountId, currentDeviceId);
     emitState(currentAccountId);
     emitDeviceEvent(currentAccountId, "leave", currentDeviceName || "Unknown Device");
