@@ -320,8 +320,16 @@ function emitToCallTarget(socket, accountId, targetDeviceId, event, payload, ack
   if (!target) {
     ack?.({ ok: false, error: "Target device is offline" });
     socket.emit("call_unavailable", { targetDeviceId, reason: "Target device is offline" });
+    console.log("[SyncWave Call]", event, "FAILED_TARGET_OFFLINE", { accountId, targetDeviceId });
     return false;
   }
+  console.log("[SyncWave Call]", event, {
+    accountId,
+    from: payload.from?.deviceName,
+    fromDeviceId: payload.from?.deviceId,
+    targetDeviceId,
+    callId: payload.callId,
+  });
   io.to(target.socketId).emit(event, payload);
   ack?.({ ok: true });
   return true;
