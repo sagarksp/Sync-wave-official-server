@@ -265,6 +265,7 @@ function getOrCreateSession(accountId) {
       },
       devices: {},
       typing: {},
+      calls: {},
     };
   }
   return sessions[accountId];
@@ -300,9 +301,10 @@ function emitDeviceEvent(accountId, type, deviceName) {
   });
 }
 
-function callDevicePayload(deviceId, deviceName) {
+function callDevicePayload(deviceId, deviceName, socketId = "") {
   return {
     deviceId,
+    socketId,
     deviceName: deviceName || "Unknown Device",
   };
 }
@@ -319,20 +321,95 @@ function emitToCallTarget(socket, accountId, targetDeviceId, event, payload, ack
   const target = getTargetSocket(accountId, targetDeviceId);
   if (!target) {
     ack?.({ ok: false, error: "Target device is offline" });
-    socket.emit("call_unavailable", { targetDeviceId, reason: "Target device is offline" });
-    console.log("[SyncWave Call]", event, "FAILED_TARGET_OFFLINE", { accountId, targetDeviceId });
+    socket.emit("call_unavailable", { targetDeviceId, callId: payload?.callId, reason: "Target device is offline" });
+    console.log("[SyncWave Call]", event, "FAILED_TARGET_OFFLINE", { accountId, targetDeviceId, callId: payload?.callId });
+    return false;
+  }
+  if (target.socketId === socket.id) {
+    ack?.({ ok: false, error: "Cannot send call event to the same socket" });
+    console.log("[SyncWave Call]", event, "FAILED_SELF_SOCKET", { accountId, targetDeviceId, socketId: socket.id });
     return false;
   }
   console.log("[SyncWave Call]", event, {
     accountId,
     from: payload.from?.deviceName,
     fromDeviceId: payload.from?.deviceId,
+    fromSocketId: socket.id,
     targetDeviceId,
+    targetSocketId: target.socketId,
     callId: payload.callId,
   });
   io.to(target.socketId).emit(event, payload);
   ack?.({ ok: true });
   return true;
+}
+
+function callLog(role, event, details) {
+  console.log(`[${role}] ${event}`, details);
+}
+
+function isCurrentSocketForDevice(accountId, deviceId, socketId) {
+  const current = getTargetSocket(accountId, deviceId);
+  return Boolean(current?.socketId && current.socketId === socketId);
+}
+
+function getCallSession(accountId, callId) {
+  const session = sessions[accountId];
+  if (!session || !callId) return null;
+  return session.calls?.[callId] || null;
+}
+
+function createCallSession(accountId, callId, caller, receiver) {
+  const session = getOrCreateSession(accountId);
+  session.calls[callId] = {
+    callId,
+    callerDeviceId: caller.deviceId,
+    callerSocketId: caller.socketId,
+    callerDeviceName: caller.deviceName,
+    receiverDeviceId: receiver.deviceId,
+    receiverSocketId: receiver.socketId,
+    receiverDeviceName: receiver.deviceName,
+    status: "ringing",
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+  return session.calls[callId];
+}
+
+function touchCallSession(call, status) {
+  if (!call) return null;
+  call.status = status || call.status;
+  call.updatedAt = Date.now();
+  return call;
+}
+
+function endCallSession(accountId, callId) {
+  if (sessions[accountId]?.calls?.[callId]) delete sessions[accountId].calls[callId];
+}
+
+function callPeerDeviceId(call, sourceDeviceId) {
+  if (!call) return "";
+  if (sourceDeviceId === call.callerDeviceId) return call.receiverDeviceId;
+  if (sourceDeviceId === call.receiverDeviceId) return call.callerDeviceId;
+  return "";
+}
+
+function validateCallParticipant(accountId, callId, sourceDeviceId, expectedTargetDeviceId, ack) {
+  const call = getCallSession(accountId, callId);
+  if (!call) {
+    ack?.({ ok: false, error: "Call not found" });
+    return null;
+  }
+  const peerDeviceId = callPeerDeviceId(call, sourceDeviceId);
+  if (!peerDeviceId) {
+    ack?.({ ok: false, error: "Device is not part of this call" });
+    return null;
+  }
+  if (expectedTargetDeviceId && expectedTargetDeviceId !== peerDeviceId) {
+    ack?.({ ok: false, error: "Call target does not match peer device" });
+    return null;
+  }
+  return call;
 }
 
 async function markDeviceOffline(accountId, deviceId) {
@@ -543,10 +620,40 @@ io.on("connection", (socket) => {
 
   socket.on("call_user", ({ targetDeviceId, callId, media }, ack) => {
     if (!currentAccountId || !currentDeviceId) return ack?.({ ok: false, error: "Device is not joined" });
-    if (!targetDeviceId || targetDeviceId === currentDeviceId) return ack?.({ ok: false, error: "Choose another device" });
-    emitToCallTarget(socket, currentAccountId, String(targetDeviceId), "incoming_call", {
-      callId: String(callId || `${currentDeviceId}-${Date.now()}`),
-      from: callDevicePayload(currentDeviceId, currentDeviceName),
+    if (!isCurrentSocketForDevice(currentAccountId, currentDeviceId, socket.id)) return ack?.({ ok: false, error: "Stale device socket" });
+    const receiverDeviceId = String(targetDeviceId || "");
+    if (!receiverDeviceId || receiverDeviceId === currentDeviceId) return ack?.({ ok: false, error: "Choose another device" });
+    const receiver = getTargetSocket(currentAccountId, receiverDeviceId);
+    if (!receiver) return emitToCallTarget(socket, currentAccountId, receiverDeviceId, "incoming_call", { callId, from: callDevicePayload(currentDeviceId, currentDeviceName, socket.id) }, ack);
+
+    const id = String(callId || `${currentDeviceId}-${Date.now()}`);
+    createCallSession(
+      currentAccountId,
+      id,
+      { deviceId: currentDeviceId, socketId: socket.id, deviceName: currentDeviceName },
+      { deviceId: receiverDeviceId, socketId: receiver.socketId, deviceName: receiver.deviceName }
+    );
+    callLog("CALLER", "CALL_SENT", {
+      callId: id,
+      socketId: socket.id,
+      deviceId: currentDeviceId,
+      deviceName: currentDeviceName,
+      receiverSocketId: receiver.socketId,
+      receiverDeviceId,
+      receiverDeviceName: receiver.deviceName,
+    });
+    callLog("RECEIVER", "CALL_RECEIVED", {
+      callId: id,
+      socketId: receiver.socketId,
+      deviceId: receiverDeviceId,
+      deviceName: receiver.deviceName,
+      callerSocketId: socket.id,
+      callerDeviceId: currentDeviceId,
+      callerDeviceName: currentDeviceName,
+    });
+    emitToCallTarget(socket, currentAccountId, receiverDeviceId, "incoming_call", {
+      callId: id,
+      from: callDevicePayload(currentDeviceId, currentDeviceName, socket.id),
       media: media || { video: true, audio: true },
       createdAt: Date.now(),
     }, ack);
@@ -554,62 +661,130 @@ io.on("connection", (socket) => {
 
   socket.on("accept_call", ({ targetDeviceId, callId }, ack) => {
     if (!currentAccountId || !currentDeviceId) return ack?.({ ok: false, error: "Device is not joined" });
-    emitToCallTarget(socket, currentAccountId, String(targetDeviceId), "accept_call", {
+    if (!isCurrentSocketForDevice(currentAccountId, currentDeviceId, socket.id)) return ack?.({ ok: false, error: "Stale device socket" });
+    const call = validateCallParticipant(currentAccountId, callId, currentDeviceId, String(targetDeviceId || ""), ack);
+    if (!call || currentDeviceId !== call.receiverDeviceId) return ack?.({ ok: false, error: "Only receiver can accept this call" });
+    call.receiverSocketId = socket.id;
+    call.callerSocketId = getTargetSocket(currentAccountId, call.callerDeviceId)?.socketId || call.callerSocketId;
+    touchCallSession(call, "accepted");
+    callLog("RECEIVER", "CALL_ACCEPTED", {
       callId,
-      from: callDevicePayload(currentDeviceId, currentDeviceName),
+      socketId: socket.id,
+      deviceId: currentDeviceId,
+      deviceName: currentDeviceName,
+      callerSocketId: call.callerSocketId,
+      callerDeviceId: call.callerDeviceId,
+    });
+    emitToCallTarget(socket, currentAccountId, call.callerDeviceId, "accept_call", {
+      callId,
+      from: callDevicePayload(currentDeviceId, currentDeviceName, socket.id),
       acceptedAt: Date.now(),
     }, ack);
   });
 
   socket.on("reject_call", ({ targetDeviceId, callId, reason }, ack) => {
     if (!currentAccountId || !currentDeviceId) return ack?.({ ok: false, error: "Device is not joined" });
-    emitToCallTarget(socket, currentAccountId, String(targetDeviceId), "reject_call", {
+    if (!isCurrentSocketForDevice(currentAccountId, currentDeviceId, socket.id)) return ack?.({ ok: false, error: "Stale device socket" });
+    const call = validateCallParticipant(currentAccountId, callId, currentDeviceId, String(targetDeviceId || ""), ack);
+    if (!call) return;
+    const peerDeviceId = callPeerDeviceId(call, currentDeviceId);
+    emitToCallTarget(socket, currentAccountId, peerDeviceId, "reject_call", {
       callId,
-      from: callDevicePayload(currentDeviceId, currentDeviceName),
+      from: callDevicePayload(currentDeviceId, currentDeviceName, socket.id),
       reason: reason || "rejected",
       endedAt: Date.now(),
     }, ack);
+    endCallSession(currentAccountId, callId);
   });
 
   socket.on("end_call", ({ targetDeviceId, callId, reason }, ack) => {
     if (!currentAccountId || !currentDeviceId) return ack?.({ ok: false, error: "Device is not joined" });
-    emitToCallTarget(socket, currentAccountId, String(targetDeviceId), "end_call", {
+    if (!isCurrentSocketForDevice(currentAccountId, currentDeviceId, socket.id)) return ack?.({ ok: false, error: "Stale device socket" });
+    const call = validateCallParticipant(currentAccountId, callId, currentDeviceId, String(targetDeviceId || ""), ack);
+    if (!call) return;
+    const peerDeviceId = callPeerDeviceId(call, currentDeviceId);
+    emitToCallTarget(socket, currentAccountId, peerDeviceId, "end_call", {
       callId,
-      from: callDevicePayload(currentDeviceId, currentDeviceName),
+      from: callDevicePayload(currentDeviceId, currentDeviceName, socket.id),
       reason: reason || "ended",
       endedAt: Date.now(),
     }, ack);
+    endCallSession(currentAccountId, callId);
   });
 
   socket.on("offer", ({ targetDeviceId, callId, offer }, ack) => {
     if (!currentAccountId || !currentDeviceId || !offer) return ack?.({ ok: false, error: "Invalid offer" });
-    emitToCallTarget(socket, currentAccountId, String(targetDeviceId), "offer", {
+    if (!isCurrentSocketForDevice(currentAccountId, currentDeviceId, socket.id)) return ack?.({ ok: false, error: "Stale device socket" });
+    const call = validateCallParticipant(currentAccountId, callId, currentDeviceId, String(targetDeviceId || ""), ack);
+    if (!call || currentDeviceId !== call.callerDeviceId) return ack?.({ ok: false, error: "Only caller can send offer" });
+    call.callerSocketId = socket.id;
+    touchCallSession(call, "offer_sent");
+    emitToCallTarget(socket, currentAccountId, call.receiverDeviceId, "offer", {
       callId,
-      from: callDevicePayload(currentDeviceId, currentDeviceName),
+      from: callDevicePayload(currentDeviceId, currentDeviceName, socket.id),
       offer,
     }, ack);
   });
 
   socket.on("answer", ({ targetDeviceId, callId, answer }, ack) => {
     if (!currentAccountId || !currentDeviceId || !answer) return ack?.({ ok: false, error: "Invalid answer" });
-    emitToCallTarget(socket, currentAccountId, String(targetDeviceId), "answer", {
+    if (!isCurrentSocketForDevice(currentAccountId, currentDeviceId, socket.id)) return ack?.({ ok: false, error: "Stale device socket" });
+    const call = validateCallParticipant(currentAccountId, callId, currentDeviceId, String(targetDeviceId || ""), ack);
+    if (!call || currentDeviceId !== call.receiverDeviceId) return ack?.({ ok: false, error: "Only receiver can send answer" });
+    call.receiverSocketId = socket.id;
+    touchCallSession(call, "answer_sent");
+    callLog("CALLER", "ANSWER_RECEIVED", {
       callId,
-      from: callDevicePayload(currentDeviceId, currentDeviceName),
+      socketId: call.callerSocketId,
+      deviceId: call.callerDeviceId,
+      deviceName: call.callerDeviceName,
+      receiverSocketId: socket.id,
+      receiverDeviceId: currentDeviceId,
+    });
+    emitToCallTarget(socket, currentAccountId, call.callerDeviceId, "answer", {
+      callId,
+      from: callDevicePayload(currentDeviceId, currentDeviceName, socket.id),
       answer,
     }, ack);
   });
 
   socket.on("ice_candidate", ({ targetDeviceId, callId, candidate }, ack) => {
     if (!currentAccountId || !currentDeviceId || !candidate) return ack?.({ ok: false, error: "Invalid ICE candidate" });
-    emitToCallTarget(socket, currentAccountId, String(targetDeviceId), "ice_candidate", {
+    if (!isCurrentSocketForDevice(currentAccountId, currentDeviceId, socket.id)) return ack?.({ ok: false, error: "Stale device socket" });
+    const call = validateCallParticipant(currentAccountId, callId, currentDeviceId, String(targetDeviceId || ""), ack);
+    if (!call) return;
+    const peerDeviceId = callPeerDeviceId(call, currentDeviceId);
+    emitToCallTarget(socket, currentAccountId, peerDeviceId, "ice_candidate", {
       callId,
-      from: callDevicePayload(currentDeviceId, currentDeviceName),
+      from: callDevicePayload(currentDeviceId, currentDeviceName, socket.id),
       candidate,
     }, ack);
   });
 
   socket.on("disconnect", async () => {
     if (!currentAccountId || !currentDeviceId || !sessions[currentAccountId]) return;
+    if (!isCurrentSocketForDevice(currentAccountId, currentDeviceId, socket.id)) {
+      console.log("[SyncWave Call] DISCONNECT_IGNORED_STALE_SOCKET", {
+        accountId: currentAccountId,
+        socketId: socket.id,
+        deviceId: currentDeviceId,
+        deviceName: currentDeviceName,
+      });
+      return;
+    }
+    Object.values(sessions[currentAccountId].calls || {}).forEach((call) => {
+      if (call.callerDeviceId !== currentDeviceId && call.receiverDeviceId !== currentDeviceId) return;
+      const peerDeviceId = callPeerDeviceId(call, currentDeviceId);
+      if (peerDeviceId) {
+        emitToCallTarget(socket, currentAccountId, peerDeviceId, "end_call", {
+          callId: call.callId,
+          from: callDevicePayload(currentDeviceId, currentDeviceName, socket.id),
+          reason: "device_disconnected",
+          endedAt: Date.now(),
+        });
+      }
+      endCallSession(currentAccountId, call.callId);
+    });
     delete sessions[currentAccountId].devices[currentDeviceId];
     delete sessions[currentAccountId].typing[currentDeviceId];
     await markDeviceOffline(currentAccountId, currentDeviceId);
