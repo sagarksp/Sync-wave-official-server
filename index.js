@@ -257,11 +257,16 @@ function getOrCreateSession(accountId) {
       state: {
         currentSong: null,
         isPlaying: false,
-        position: 0,
-        positionTimestamp: Date.now(),
+        positionAtPlay: 0,
+        startedAt: null,
         volume: 80,
         queue: [],
         syncEnabled: true,
+        hostDeviceId: null,
+        hostDeviceName: null,
+        version: 0,
+        lastAction: "INIT",
+        lastActionId: 0,
       },
       devices: {},
       typing: {},
@@ -273,15 +278,37 @@ function getOrCreateSession(accountId) {
 
 function getLivePosition(session) {
   const s = session.state;
-  if (!s.isPlaying || !s.currentSong) return s.position;
-  const elapsed = (Date.now() - s.positionTimestamp) / 1000;
-  return Math.min(s.position + elapsed, s.currentSong.duration || 9999);
+  const base = Number(s.positionAtPlay) || 0;
+  if (!s.isPlaying || !s.currentSong || !s.startedAt) return base;
+  const elapsed = (Date.now() - s.startedAt) / 1000;
+  return Math.min(base + elapsed, s.currentSong.duration || 9999);
+}
+
+function clampPosition(session, position) {
+  const duration = session.state.currentSong?.duration || 9999;
+  return Math.max(0, Math.min(Number(position) || 0, duration));
+}
+
+function setPlaybackCheckpoint(session, position, isPlaying = session.state.isPlaying) {
+  session.state.positionAtPlay = clampPosition(session, position);
+  session.state.startedAt = isPlaying ? Date.now() : null;
+  session.state.isPlaying = Boolean(isPlaying);
+}
+
+function markStateAction(session, action, deviceId, deviceName) {
+  session.state.version = (session.state.version || 0) + 1;
+  session.state.lastAction = action;
+  session.state.lastActionId = session.state.version;
+  session.state.lastActionDeviceId = deviceId || "";
+  session.state.lastActionDeviceName = deviceName || "";
 }
 
 function statePayload(session) {
+  const serverTime = Date.now();
   return {
     ...session.state,
     position: getLivePosition(session),
+    serverTime,
     devices: Object.values(session.devices),
   };
 }
@@ -298,6 +325,26 @@ function emitDeviceEvent(accountId, type, deviceName) {
     deviceName,
     message: type === "join" ? "New device connected" : "Device disconnected",
     timestamp: Date.now(),
+  });
+}
+
+function assignHostIfNeeded(session) {
+  if (session.state.hostDeviceId && session.devices[session.state.hostDeviceId]) return;
+  const nextHost = Object.values(session.devices)[0] || null;
+  session.state.hostDeviceId = nextHost?.deviceId || null;
+  session.state.hostDeviceName = nextHost?.deviceName || null;
+}
+
+function isHostDevice(session, deviceId) {
+  assignHostIfNeeded(session);
+  return Boolean(deviceId && session.state.hostDeviceId === deviceId);
+}
+
+function rejectNonHost(socket, session, action) {
+  socket.emit("control_rejected", {
+    action,
+    hostDeviceId: session.state.hostDeviceId,
+    hostDeviceName: session.state.hostDeviceName,
   });
 }
 
@@ -467,6 +514,7 @@ io.on("connection", (socket) => {
         online: true,
         joinedAt: Date.now(),
       };
+      assignHostIfNeeded(session);
 
       if (existing) {
         await User.updateOne(
@@ -516,66 +564,75 @@ io.on("connection", (socket) => {
   socket.on("play_song", ({ song }) => {
     if (!currentAccountId || !song) return;
     const session = sessions[currentAccountId];
+    if (!isHostDevice(session, currentDeviceId)) return rejectNonHost(socket, session, "play_song");
     session.state.currentSong = song;
-    session.state.isPlaying = true;
-    session.state.position = 0;
-    session.state.positionTimestamp = Date.now();
+    setPlaybackCheckpoint(session, 0, true);
     if (!session.state.queue.find((s) => s.id === song.id)) {
       session.state.queue = [song, ...session.state.queue].slice(0, 100);
     }
+    markStateAction(session, "SONG_CHANGE", currentDeviceId, currentDeviceName);
+    console.log("[SyncWave Sync] STATE_UPDATE", { action: "SONG_CHANGE", deviceName: currentDeviceName, serverPosition: getLivePosition(session) });
     if (session.state.syncEnabled) emitState(currentAccountId);
   });
 
   socket.on("play_pause", ({ isPlaying }) => {
     if (!currentAccountId) return;
     const session = sessions[currentAccountId];
+    if (!isHostDevice(session, currentDeviceId)) return rejectNonHost(socket, session, "play_pause");
     const livePos = getLivePosition(session);
-    session.state.isPlaying = Boolean(isPlaying);
-    session.state.position = livePos;
-    session.state.positionTimestamp = Date.now();
+    setPlaybackCheckpoint(session, livePos, Boolean(isPlaying));
+    markStateAction(session, session.state.isPlaying ? "PLAY" : "PAUSE", currentDeviceId, currentDeviceName);
+    console.log("[SyncWave Sync] STATE_UPDATE", { action: session.state.lastAction, deviceName: currentDeviceName, serverPosition: getLivePosition(session) });
     if (session.state.syncEnabled) emitState(currentAccountId);
   });
 
   socket.on("seek", ({ position }) => {
     if (!currentAccountId) return;
     const session = sessions[currentAccountId];
-    session.state.position = Math.max(0, Number(position) || 0);
-    session.state.positionTimestamp = Date.now();
+    if (!isHostDevice(session, currentDeviceId)) return rejectNonHost(socket, session, "seek");
+    setPlaybackCheckpoint(session, position, session.state.isPlaying);
+    markStateAction(session, "SEEK", currentDeviceId, currentDeviceName);
+    console.log("[SyncWave Sync] SEEK_RECEIVED", { deviceName: currentDeviceName, position: session.state.positionAtPlay });
+    console.log("[SyncWave Sync] STATE_UPDATE", { action: "SEEK", deviceName: currentDeviceName, serverPosition: getLivePosition(session) });
     if (session.state.syncEnabled) emitState(currentAccountId);
   });
 
   socket.on("next_song", () => {
     if (!currentAccountId) return;
     const session = sessions[currentAccountId];
+    if (!isHostDevice(session, currentDeviceId)) return rejectNonHost(socket, session, "next_song");
     if (!session.state.queue.length) return;
     const idx = session.state.queue.findIndex((s) => s.id === session.state.currentSong?.id);
     const next = session.state.queue[(idx + 1) % session.state.queue.length];
     if (!next) return;
     session.state.currentSong = next;
-    session.state.isPlaying = true;
-    session.state.position = 0;
-    session.state.positionTimestamp = Date.now();
+    setPlaybackCheckpoint(session, 0, true);
+    markStateAction(session, "NEXT", currentDeviceId, currentDeviceName);
+    console.log("[SyncWave Sync] STATE_UPDATE", { action: "NEXT", deviceName: currentDeviceName, serverPosition: getLivePosition(session) });
     if (session.state.syncEnabled) emitState(currentAccountId);
   });
 
   socket.on("prev_song", () => {
     if (!currentAccountId) return;
     const session = sessions[currentAccountId];
+    if (!isHostDevice(session, currentDeviceId)) return rejectNonHost(socket, session, "prev_song");
     if (!session.state.queue.length) return;
     const idx = session.state.queue.findIndex((s) => s.id === session.state.currentSong?.id);
     const prev = session.state.queue[(idx - 1 + session.state.queue.length) % session.state.queue.length];
     if (!prev) return;
     session.state.currentSong = prev;
-    session.state.isPlaying = true;
-    session.state.position = 0;
-    session.state.positionTimestamp = Date.now();
+    setPlaybackCheckpoint(session, 0, true);
+    markStateAction(session, "PREV", currentDeviceId, currentDeviceName);
+    console.log("[SyncWave Sync] STATE_UPDATE", { action: "PREV", deviceName: currentDeviceName, serverPosition: getLivePosition(session) });
     if (session.state.syncEnabled) emitState(currentAccountId);
   });
 
   socket.on("set_queue", ({ queue }) => {
     if (!currentAccountId || !Array.isArray(queue)) return;
     const session = sessions[currentAccountId];
+    if (!isHostDevice(session, currentDeviceId)) return rejectNonHost(socket, session, "set_queue");
     session.state.queue = queue.filter(Boolean).slice(0, 100);
+    markStateAction(session, "QUEUE", currentDeviceId, currentDeviceName);
     if (session.state.syncEnabled) emitState(currentAccountId);
   });
 
@@ -787,6 +844,7 @@ io.on("connection", (socket) => {
     });
     delete sessions[currentAccountId].devices[currentDeviceId];
     delete sessions[currentAccountId].typing[currentDeviceId];
+    assignHostIfNeeded(sessions[currentAccountId]);
     await markDeviceOffline(currentAccountId, currentDeviceId);
     emitState(currentAccountId);
     emitDeviceEvent(currentAccountId, "leave", currentDeviceName || "Unknown Device");
