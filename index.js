@@ -262,8 +262,6 @@ function getOrCreateSession(accountId) {
         volume: 80,
         queue: [],
         syncEnabled: true,
-        hostDeviceId: null,
-        hostDeviceName: null,
         version: 0,
         lastAction: "INIT",
         lastActionId: 0,
@@ -325,26 +323,6 @@ function emitDeviceEvent(accountId, type, deviceName) {
     deviceName,
     message: type === "join" ? "New device connected" : "Device disconnected",
     timestamp: Date.now(),
-  });
-}
-
-function assignHostIfNeeded(session) {
-  if (session.state.hostDeviceId && session.devices[session.state.hostDeviceId]) return;
-  const nextHost = Object.values(session.devices)[0] || null;
-  session.state.hostDeviceId = nextHost?.deviceId || null;
-  session.state.hostDeviceName = nextHost?.deviceName || null;
-}
-
-function isHostDevice(session, deviceId) {
-  assignHostIfNeeded(session);
-  return Boolean(deviceId && session.state.hostDeviceId === deviceId);
-}
-
-function rejectNonHost(socket, session, action) {
-  socket.emit("control_rejected", {
-    action,
-    hostDeviceId: session.state.hostDeviceId,
-    hostDeviceName: session.state.hostDeviceName,
   });
 }
 
@@ -514,7 +492,6 @@ io.on("connection", (socket) => {
         online: true,
         joinedAt: Date.now(),
       };
-      assignHostIfNeeded(session);
 
       if (existing) {
         await User.updateOne(
@@ -564,7 +541,6 @@ io.on("connection", (socket) => {
   socket.on("play_song", ({ song }) => {
     if (!currentAccountId || !song) return;
     const session = sessions[currentAccountId];
-    if (!isHostDevice(session, currentDeviceId)) return rejectNonHost(socket, session, "play_song");
     session.state.currentSong = song;
     setPlaybackCheckpoint(session, 0, true);
     if (!session.state.queue.find((s) => s.id === song.id)) {
@@ -578,7 +554,6 @@ io.on("connection", (socket) => {
   socket.on("play_pause", ({ isPlaying }) => {
     if (!currentAccountId) return;
     const session = sessions[currentAccountId];
-    if (!isHostDevice(session, currentDeviceId)) return rejectNonHost(socket, session, "play_pause");
     const livePos = getLivePosition(session);
     setPlaybackCheckpoint(session, livePos, Boolean(isPlaying));
     markStateAction(session, session.state.isPlaying ? "PLAY" : "PAUSE", currentDeviceId, currentDeviceName);
@@ -589,7 +564,6 @@ io.on("connection", (socket) => {
   socket.on("seek", ({ position }) => {
     if (!currentAccountId) return;
     const session = sessions[currentAccountId];
-    if (!isHostDevice(session, currentDeviceId)) return rejectNonHost(socket, session, "seek");
     setPlaybackCheckpoint(session, position, session.state.isPlaying);
     markStateAction(session, "SEEK", currentDeviceId, currentDeviceName);
     console.log("[SyncWave Sync] SEEK_RECEIVED", { deviceName: currentDeviceName, position: session.state.positionAtPlay });
@@ -600,7 +574,6 @@ io.on("connection", (socket) => {
   socket.on("next_song", () => {
     if (!currentAccountId) return;
     const session = sessions[currentAccountId];
-    if (!isHostDevice(session, currentDeviceId)) return rejectNonHost(socket, session, "next_song");
     if (!session.state.queue.length) return;
     const idx = session.state.queue.findIndex((s) => s.id === session.state.currentSong?.id);
     const next = session.state.queue[(idx + 1) % session.state.queue.length];
@@ -615,7 +588,6 @@ io.on("connection", (socket) => {
   socket.on("prev_song", () => {
     if (!currentAccountId) return;
     const session = sessions[currentAccountId];
-    if (!isHostDevice(session, currentDeviceId)) return rejectNonHost(socket, session, "prev_song");
     if (!session.state.queue.length) return;
     const idx = session.state.queue.findIndex((s) => s.id === session.state.currentSong?.id);
     const prev = session.state.queue[(idx - 1 + session.state.queue.length) % session.state.queue.length];
@@ -630,7 +602,6 @@ io.on("connection", (socket) => {
   socket.on("set_queue", ({ queue }) => {
     if (!currentAccountId || !Array.isArray(queue)) return;
     const session = sessions[currentAccountId];
-    if (!isHostDevice(session, currentDeviceId)) return rejectNonHost(socket, session, "set_queue");
     session.state.queue = queue.filter(Boolean).slice(0, 100);
     markStateAction(session, "QUEUE", currentDeviceId, currentDeviceName);
     if (session.state.syncEnabled) emitState(currentAccountId);
@@ -844,7 +815,6 @@ io.on("connection", (socket) => {
     });
     delete sessions[currentAccountId].devices[currentDeviceId];
     delete sessions[currentAccountId].typing[currentDeviceId];
-    assignHostIfNeeded(sessions[currentAccountId]);
     await markDeviceOffline(currentAccountId, currentDeviceId);
     emitState(currentAccountId);
     emitDeviceEvent(currentAccountId, "leave", currentDeviceName || "Unknown Device");
