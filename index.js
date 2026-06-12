@@ -30,6 +30,20 @@ mongoose
   .catch((err) => console.error("MongoDB connection error:", err.message));
 
 const SAAVN_BASE = "https://saavn.sumit.co";
+const TURN_URLS = (process.env.TURN_URLS || "")
+  .split(",")
+  .map((url) => url.trim())
+  .filter(Boolean);
+const TURN_USERNAME = process.env.TURN_USERNAME || "";
+const TURN_CREDENTIAL = process.env.TURN_CREDENTIAL || "";
+
+function callIceServers() {
+  const servers = [{ urls: ["stun:stun.l.google.com:19302", "stun:global.stun.twilio.com:3478"] }];
+  if (TURN_URLS.length && TURN_USERNAME && TURN_CREDENTIAL) {
+    servers.push({ urls: TURN_URLS, username: TURN_USERNAME, credential: TURN_CREDENTIAL });
+  }
+  return servers;
+}
 
 function publicUser(user) {
   return {
@@ -83,6 +97,10 @@ app.get("/api/auth/session", authRequired, (req, res) => {
   res.json({ user: publicUser(req.user) });
 });
 
+app.get("/api/call/config", authRequired, (req, res) => {
+  res.json({ iceServers: callIceServers() });
+});
+
 app.post("/api/auth/logout", authRequired, async (req, res) => {
   const deviceId = String(req.body.deviceId || "");
   if (deviceId) {
@@ -124,6 +142,46 @@ app.get("/api/song/:id", async (req, res) => {
     res.json(formatSong(data.data[0]));
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/download/:id", authRequired, async (req, res) => {
+  try {
+    const url = `${SAAVN_BASE}/api/songs/${req.params.id}`;
+    const response = await fetch(url, { headers: { "User-Agent": "SyncWave/1.0" } });
+    const data = await response.json();
+    if (!data.data || !data.data[0]) return res.status(404).json({ error: "Song not found" });
+    const song = formatSong(data.data[0]);
+    if (!song?.streamUrl) return res.status(404).json({ error: "Download URL unavailable" });
+    res.json({
+      song,
+      downloadUrl: `/api/download/proxy?url=${encodeURIComponent(song.streamUrl)}&songId=${encodeURIComponent(song.id)}`,
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Download lookup failed" });
+  }
+});
+
+app.get("/api/download/proxy", authRequired, async (req, res) => {
+  try {
+    const rawUrl = String(req.query.url || "");
+    const parsed = new URL(rawUrl);
+    if (!["http:", "https:"].includes(parsed.protocol)) return res.status(400).json({ error: "Invalid download URL" });
+    const host = parsed.hostname.toLowerCase();
+    const allowedAudioHost = host === "saavncdn.com" || host.endsWith(".saavncdn.com") || host === "jiosaavn.com" || host.endsWith(".jiosaavn.com");
+    if (!allowedAudioHost) return res.status(403).json({ error: "Download host not allowed" });
+
+    const response = await fetch(rawUrl, { headers: { "User-Agent": "SyncWave/1.0" } });
+    if (!response.ok) return res.status(response.status).json({ error: "Download source failed" });
+
+    const filename = `syncwave-${String(req.query.songId || "song").replace(/[^a-z0-9_-]/gi, "") || "song"}.mp3`;
+    res.setHeader("Content-Type", response.headers.get("content-type") || "audio/mpeg");
+    const contentLength = response.headers.get("content-length");
+    if (contentLength) res.setHeader("Content-Length", contentLength);
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    response.body.pipe(res);
+  } catch (err) {
+    res.status(400).json({ error: "Unable to download song" });
   }
 });
 
@@ -240,6 +298,33 @@ function emitDeviceEvent(accountId, type, deviceName) {
     message: type === "join" ? "New device connected" : "Device disconnected",
     timestamp: Date.now(),
   });
+}
+
+function callDevicePayload(deviceId, deviceName) {
+  return {
+    deviceId,
+    deviceName: deviceName || "Unknown Device",
+  };
+}
+
+function getTargetSocket(accountId, targetDeviceId) {
+  const session = sessions[accountId];
+  if (!session || !targetDeviceId) return null;
+  const target = session.devices[targetDeviceId];
+  if (!target?.socketId) return null;
+  return target;
+}
+
+function emitToCallTarget(socket, accountId, targetDeviceId, event, payload, ack) {
+  const target = getTargetSocket(accountId, targetDeviceId);
+  if (!target) {
+    ack?.({ ok: false, error: "Target device is offline" });
+    socket.emit("call_unavailable", { targetDeviceId, reason: "Target device is offline" });
+    return false;
+  }
+  io.to(target.socketId).emit(event, payload);
+  ack?.({ ok: true });
+  return true;
 }
 
 async function markDeviceOffline(accountId, deviceId) {
@@ -446,6 +531,73 @@ io.on("connection", (socket) => {
         .filter(([id]) => id !== currentDeviceId)
         .map(([, name]) => name),
     });
+  });
+
+  socket.on("call_user", ({ targetDeviceId, callId, media }, ack) => {
+    if (!currentAccountId || !currentDeviceId) return ack?.({ ok: false, error: "Device is not joined" });
+    if (!targetDeviceId || targetDeviceId === currentDeviceId) return ack?.({ ok: false, error: "Choose another device" });
+    emitToCallTarget(socket, currentAccountId, String(targetDeviceId), "incoming_call", {
+      callId: String(callId || `${currentDeviceId}-${Date.now()}`),
+      from: callDevicePayload(currentDeviceId, currentDeviceName),
+      media: media || { video: true, audio: true },
+      createdAt: Date.now(),
+    }, ack);
+  });
+
+  socket.on("accept_call", ({ targetDeviceId, callId }, ack) => {
+    if (!currentAccountId || !currentDeviceId) return ack?.({ ok: false, error: "Device is not joined" });
+    emitToCallTarget(socket, currentAccountId, String(targetDeviceId), "accept_call", {
+      callId,
+      from: callDevicePayload(currentDeviceId, currentDeviceName),
+      acceptedAt: Date.now(),
+    }, ack);
+  });
+
+  socket.on("reject_call", ({ targetDeviceId, callId, reason }, ack) => {
+    if (!currentAccountId || !currentDeviceId) return ack?.({ ok: false, error: "Device is not joined" });
+    emitToCallTarget(socket, currentAccountId, String(targetDeviceId), "reject_call", {
+      callId,
+      from: callDevicePayload(currentDeviceId, currentDeviceName),
+      reason: reason || "rejected",
+      endedAt: Date.now(),
+    }, ack);
+  });
+
+  socket.on("end_call", ({ targetDeviceId, callId, reason }, ack) => {
+    if (!currentAccountId || !currentDeviceId) return ack?.({ ok: false, error: "Device is not joined" });
+    emitToCallTarget(socket, currentAccountId, String(targetDeviceId), "end_call", {
+      callId,
+      from: callDevicePayload(currentDeviceId, currentDeviceName),
+      reason: reason || "ended",
+      endedAt: Date.now(),
+    }, ack);
+  });
+
+  socket.on("offer", ({ targetDeviceId, callId, offer }, ack) => {
+    if (!currentAccountId || !currentDeviceId || !offer) return ack?.({ ok: false, error: "Invalid offer" });
+    emitToCallTarget(socket, currentAccountId, String(targetDeviceId), "offer", {
+      callId,
+      from: callDevicePayload(currentDeviceId, currentDeviceName),
+      offer,
+    }, ack);
+  });
+
+  socket.on("answer", ({ targetDeviceId, callId, answer }, ack) => {
+    if (!currentAccountId || !currentDeviceId || !answer) return ack?.({ ok: false, error: "Invalid answer" });
+    emitToCallTarget(socket, currentAccountId, String(targetDeviceId), "answer", {
+      callId,
+      from: callDevicePayload(currentDeviceId, currentDeviceName),
+      answer,
+    }, ack);
+  });
+
+  socket.on("ice_candidate", ({ targetDeviceId, callId, candidate }, ack) => {
+    if (!currentAccountId || !currentDeviceId || !candidate) return ack?.({ ok: false, error: "Invalid ICE candidate" });
+    emitToCallTarget(socket, currentAccountId, String(targetDeviceId), "ice_candidate", {
+      callId,
+      from: callDevicePayload(currentDeviceId, currentDeviceName),
+      candidate,
+    }, ack);
   });
 
   socket.on("disconnect", async () => {
