@@ -758,10 +758,11 @@ io.on("connection", (socket) => {
       deviceName: currentDeviceName || "Unknown Device",
       seenAt: new Date(),
     };
-    await Message.updateMany(
+    const result = await Message.updateMany(
       { _id: { $in: ids }, accountId: currentAccountId, "seenBy.deviceId": { $ne: currentDeviceId } },
       { $push: { seenBy: seen } }
     );
+    if (!result.modifiedCount) return;
     io.to(currentAccountId).emit("messages_seen", { messageIds: ids, seen });
   });
 
