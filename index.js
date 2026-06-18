@@ -90,6 +90,39 @@ function callIceServers() {
   return servers;
 }
 
+async function fetchSaavnJson(url, context = {}) {
+  const response = await fetch(url, { headers: { "User-Agent": "SyncWave/1.0" } });
+  const contentType = response.headers.get("content-type") || "";
+  const body = await response.text();
+  const preview = body.replace(/\s+/g, " ").trim().slice(0, 500);
+
+  console.log("[SAAVN_RESPONSE]", {
+    ...context,
+    status: response.status,
+    statusText: response.statusText,
+    contentType,
+    bodyPreview: preview,
+  });
+
+  if (!response.ok) {
+    const err = new Error(`Saavn upstream failed with ${response.status} ${response.statusText}`);
+    err.statusCode = 502;
+    err.upstreamStatus = response.status;
+    err.upstreamPreview = preview;
+    throw err;
+  }
+
+  try {
+    return JSON.parse(body);
+  } catch (err) {
+    err.statusCode = 502;
+    err.message = `Saavn upstream returned non-JSON response: ${err.message}`;
+    err.upstreamContentType = contentType;
+    err.upstreamPreview = preview;
+    throw err;
+  }
+}
+
 function publicUser(user) {
   return {
     id: user._id.toString(),
@@ -276,14 +309,36 @@ app.get("/api/search", async (req, res) => {
     const { q, limit = 20, page = 0 } = req.query;
     if (!q) return res.status(400).json({ error: "query required" });
 
+    console.log("[SEARCH_REQUEST]", {
+      requestId: req.requestId,
+      query: { q, limit, page },
+    });
     const url = `${SAAVN_BASE}/api/search/songs?query=${encodeURIComponent(q)}&limit=${limit}&page=${page}`;
-    const response = await fetch(url, { headers: { "User-Agent": "SyncWave/1.0" } });
-    const data = await response.json();
-    const songs = (data.data?.results || []).map(formatSong).filter(Boolean);
+    const data = await fetchSaavnJson(url, { route: "/api/search", requestId: req.requestId });
+    const rawResults = data.data?.results || [];
+    const songs = rawResults.map(formatSong).filter(Boolean);
+    console.log("[SEARCH_RESULTS]", {
+      requestId: req.requestId,
+      rawCount: rawResults.length,
+      parsedCount: songs.length,
+    });
     res.json({ results: songs, total: data.data?.total || songs.length });
   } catch (err) {
-    console.error("Search error:", err.message);
-    res.status(500).json({ error: "Search failed", details: err.message });
+    console.error("[SEARCH_ERROR]", {
+      requestId: req.requestId,
+      query: req.query,
+      name: err.name,
+      message: err.message,
+      upstreamStatus: err.upstreamStatus,
+      upstreamContentType: err.upstreamContentType,
+      upstreamPreview: err.upstreamPreview,
+      stack: err.stack,
+    });
+    res.status(err.statusCode || 500).json({
+      error: err.statusCode === 502 ? "Search provider unavailable" : "Search failed",
+      details: err.message,
+      requestId: req.requestId,
+    });
   }
 });
 
