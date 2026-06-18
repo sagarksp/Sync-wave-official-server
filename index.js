@@ -10,6 +10,7 @@ const jwt = require("jsonwebtoken");
 const mongoose = require("mongoose");
 const User = require("./models/User");
 const Message = require("./models/Message");
+const Playlist = require("./models/Playlist");
 const { authRequired, signToken, JWT_SECRET } = require("./middleware/auth");
 
 const app = express();
@@ -115,6 +116,74 @@ app.post("/api/auth/logout", authRequired, async (req, res) => {
 app.get("/api/messages", authRequired, async (req, res) => {
   const messages = await Message.find({ accountId: req.user._id }).sort({ timestamp: -1 }).limit(80).lean();
   res.json({ messages: messages.reverse() });
+});
+
+function publicPlaylist(playlist) {
+  return {
+    id: playlist._id.toString(),
+    ownerAccountId: playlist.ownerAccountId.toString(),
+    name: playlist.name,
+    songs: playlist.songs || [],
+    createdAt: playlist.createdAt,
+    updatedAt: playlist.updatedAt,
+  };
+}
+
+function cleanPlaylistName(name) {
+  return String(name || "New Playlist").trim().slice(0, 80) || "New Playlist";
+}
+
+function cleanSong(song) {
+  if (!song?.id) return null;
+  return {
+    id: String(song.id),
+    title: String(song.title || "Unknown").slice(0, 160),
+    artist: String(song.artist || "").slice(0, 160),
+    album: String(song.album || "").slice(0, 160),
+    duration: Number(song.duration) || 0,
+    cover: String(song.cover || "").slice(0, 1000),
+    streamUrl: String(song.streamUrl || "").slice(0, 1200),
+    language: String(song.language || "").slice(0, 80),
+    year: String(song.year || "").slice(0, 20),
+  };
+}
+
+app.get("/api/playlists", authRequired, async (req, res) => {
+  const playlists = await Playlist.find({ ownerAccountId: req.user._id }).sort({ updatedAt: -1 }).lean();
+  res.json({ playlists: playlists.map(publicPlaylist) });
+});
+
+app.post("/api/playlists", authRequired, async (req, res) => {
+  const songs = Array.isArray(req.body.songs) ? req.body.songs.map(cleanSong).filter(Boolean).slice(0, 500) : [];
+  const playlist = await Playlist.create({
+    ownerAccountId: req.user._id,
+    name: cleanPlaylistName(req.body.name),
+    songs,
+    updatedAt: new Date(),
+  });
+  res.status(201).json({ playlist: publicPlaylist(playlist) });
+});
+
+app.patch("/api/playlists/:id", authRequired, async (req, res) => {
+  const patch = { updatedAt: new Date() };
+  if (Object.prototype.hasOwnProperty.call(req.body, "name")) patch.name = cleanPlaylistName(req.body.name);
+  if (Object.prototype.hasOwnProperty.call(req.body, "songs")) {
+    patch.songs = Array.isArray(req.body.songs) ? req.body.songs.map(cleanSong).filter(Boolean).slice(0, 500) : [];
+  }
+
+  const playlist = await Playlist.findOneAndUpdate(
+    { _id: req.params.id, ownerAccountId: req.user._id },
+    { $set: patch },
+    { new: true }
+  ).lean();
+  if (!playlist) return res.status(404).json({ error: "Playlist not found" });
+  res.json({ playlist: publicPlaylist(playlist) });
+});
+
+app.delete("/api/playlists/:id", authRequired, async (req, res) => {
+  const deleted = await Playlist.findOneAndDelete({ _id: req.params.id, ownerAccountId: req.user._id }).lean();
+  if (!deleted) return res.status(404).json({ error: "Playlist not found" });
+  res.json({ ok: true });
 });
 
 app.get("/api/search", async (req, res) => {
@@ -303,11 +372,18 @@ function markStateAction(session, action, deviceId, deviceName) {
 
 function statePayload(session) {
   const serverTime = Date.now();
+  const currentActivity = session.state.currentSong && session.state.isPlaying
+    ? `Listening: ${session.state.currentSong.title}`
+    : "Idle";
   return {
     ...session.state,
     position: getLivePosition(session),
     serverTime,
-    devices: Object.values(session.devices),
+    devices: Object.values(session.devices).map((device) => ({
+      ...device,
+      currentActivity,
+      lastSeen: device.lastSeen || device.joinedAt || serverTime,
+    })),
   };
 }
 
@@ -491,6 +567,7 @@ io.on("connection", (socket) => {
         deviceName: currentDeviceName,
         online: true,
         joinedAt: Date.now(),
+        lastSeen: Date.now(),
       };
 
       if (existing) {
