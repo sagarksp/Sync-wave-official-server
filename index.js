@@ -351,6 +351,9 @@ function formatSong(s) {
     duration: parseInt(s.duration, 10) || 0,
     cover: image,
     streamUrl,
+    audioUrl: streamUrl,
+    mediaUrl: streamUrl,
+    downloadUrl: streamUrl,
     language: s.language || "",
     year: s.year || "",
   };
