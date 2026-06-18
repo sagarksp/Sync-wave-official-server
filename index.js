@@ -252,7 +252,8 @@ app.get("/api/song/:id", async (req, res) => {
   }
 });
 
-app.get("/api/download/:id", authRequired, async (req, res) => {
+app.get("/api/download/:id", authRequired, async (req, res, next) => {
+  if (req.params.id === "proxy") return next();
   try {
     const url = `${SAAVN_BASE}/api/songs/${req.params.id}`;
     const response = await fetch(url, { headers: { "User-Agent": "SyncWave/1.0" } });
@@ -966,5 +967,14 @@ io.on("connection", (socket) => {
   });
 });
 
+function registeredRoutes() {
+  return app._router.stack
+    .filter((layer) => layer.route?.path)
+    .flatMap((layer) => Object.keys(layer.route.methods).map((method) => `${method.toUpperCase()} ${layer.route.path}`));
+}
+
 const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => console.log(`SyncWave server running on :${PORT}`));
+server.listen(PORT, () => {
+  console.log(`SyncWave server running on :${PORT}`);
+  console.log("[SyncWave Routes]", registeredRoutes());
+});
