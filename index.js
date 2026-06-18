@@ -50,6 +50,8 @@ function publicUser(user) {
   return {
     id: user._id.toString(),
     username: user.username,
+    displayName: user.displayName || user.username,
+    avatarUrl: user.avatarUrl || "",
     maxDevices: user.maxDevices,
     activeDevices: user.activeDevices,
     createdAt: user.createdAt,
@@ -71,7 +73,7 @@ app.post("/api/auth/register", async (req, res) => {
     if (exists) return res.status(409).json({ error: "Username already exists" });
 
     const passwordHash = await bcrypt.hash(password, 12);
-    const user = await User.create({ username, passwordHash });
+    const user = await User.create({ username, displayName: username, passwordHash });
     res.status(201).json({ token: signToken(user), user: publicUser(user) });
   } catch (err) {
     res.status(500).json({ error: "Registration failed" });
@@ -96,6 +98,32 @@ app.post("/api/auth/login", async (req, res) => {
 
 app.get("/api/auth/session", authRequired, (req, res) => {
   res.json({ user: publicUser(req.user) });
+});
+
+app.patch("/api/profile", authRequired, async (req, res) => {
+  const displayName = String(req.body.displayName || "").trim().slice(0, 60);
+  const avatarUrl = String(req.body.avatarUrl || "").trim().slice(0, 1000);
+  const user = await User.findByIdAndUpdate(
+    req.user._id,
+    { $set: { displayName: displayName || req.user.username, avatarUrl } },
+    { new: true }
+  );
+  res.json({ user: publicUser(user) });
+});
+
+app.post("/api/profile/password", authRequired, async (req, res) => {
+  const currentPassword = String(req.body.currentPassword || "");
+  const nextPassword = String(req.body.nextPassword || "");
+  if (nextPassword.length < 6) return res.status(400).json({ error: "New password must be at least 6 characters" });
+  const user = await User.findById(req.user._id);
+  const valid = await bcrypt.compare(currentPassword, user.passwordHash);
+  if (!valid) return res.status(401).json({ error: "Current password is incorrect" });
+  user.passwordHash = await bcrypt.hash(nextPassword, 12);
+  user.authVersion = (user.authVersion || 0) + 1;
+  user.activeDevices = [];
+  await user.save();
+  io.to(req.user._id.toString()).emit("force_logout", { reason: "password_changed" });
+  res.json({ ok: true });
 });
 
 app.get("/api/call/config", authRequired, (req, res) => {
@@ -183,6 +211,15 @@ app.patch("/api/playlists/:id", authRequired, async (req, res) => {
 app.delete("/api/playlists/:id", authRequired, async (req, res) => {
   const deleted = await Playlist.findOneAndDelete({ _id: req.params.id, ownerAccountId: req.user._id }).lean();
   if (!deleted) return res.status(404).json({ error: "Playlist not found" });
+  res.json({ ok: true });
+});
+
+app.post("/api/auth/logout-all", authRequired, async (req, res) => {
+  await User.updateOne(
+    { _id: req.user._id },
+    { $inc: { authVersion: 1 }, $set: { activeDevices: [] } }
+  );
+  io.to(req.user._id.toString()).emit("force_logout", { reason: "logout_all" });
   res.json({ ok: true });
 });
 
@@ -533,6 +570,7 @@ io.use(async (socket, next) => {
     const payload = jwt.verify(token, JWT_SECRET);
     const user = await User.findById(payload.userId);
     if (!user) return next(new Error("Invalid session"));
+    if ((payload.authVersion || 0) !== (user.authVersion || 0)) return next(new Error("Session expired"));
     socket.user = user;
     next();
   } catch (err) {
@@ -709,6 +747,22 @@ io.on("connection", (socket) => {
       timestamp: new Date(),
     });
     io.to(currentAccountId).emit("chat_message", saved);
+  });
+
+  socket.on("chat_seen", async ({ messageIds } = {}) => {
+    if (!currentAccountId || !currentDeviceId) return;
+    const ids = Array.isArray(messageIds) ? messageIds.filter(Boolean).slice(-120) : [];
+    if (!ids.length) return;
+    const seen = {
+      deviceId: currentDeviceId,
+      deviceName: currentDeviceName || "Unknown Device",
+      seenAt: new Date(),
+    };
+    await Message.updateMany(
+      { _id: { $in: ids }, accountId: currentAccountId, "seenBy.deviceId": { $ne: currentDeviceId } },
+      { $push: { seenBy: seen } }
+    );
+    io.to(currentAccountId).emit("messages_seen", { messageIds: ids, seen });
   });
 
   socket.on("typing", ({ isTyping }) => {
