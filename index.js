@@ -23,6 +23,7 @@ app.use(express.json({ limit: "1mb" }));
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: CLIENT_ORIGIN === "*" ? "*" : CLIENT_ORIGIN.split(","), methods: ["GET", "POST"] },
+  maxHttpBufferSize: 4 * 1024 * 1024,
 });
 
 mongoose
@@ -736,14 +737,23 @@ io.on("connection", (socket) => {
     emitState(currentAccountId);
   });
 
-  socket.on("chat_message", async ({ message }) => {
+  socket.on("chat_message", async ({ message, attachments }) => {
     if (!currentAccountId) return;
     const text = String(message || "").trim().slice(0, 1000);
-    if (!text) return;
+    const cleanAttachments = Array.isArray(attachments)
+      ? attachments.slice(0, 4).map((item) => ({
+        name: String(item.name || "Attachment").slice(0, 120),
+        type: String(item.type || "application/octet-stream").slice(0, 120),
+        size: Math.max(0, Number(item.size) || 0),
+        dataUrl: String(item.dataUrl || "").slice(0, 900000),
+      })).filter((item) => item.dataUrl.startsWith("data:"))
+      : [];
+    if (!text && !cleanAttachments.length) return;
     const saved = await Message.create({
       accountId: currentAccountId,
       deviceName: currentDeviceName || "Unknown Device",
-      message: text,
+      message: text || (cleanAttachments.length ? "Attachment" : ""),
+      attachments: cleanAttachments,
       timestamp: new Date(),
     });
     io.to(currentAccountId).emit("chat_message", saved);
