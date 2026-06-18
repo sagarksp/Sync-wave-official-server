@@ -20,53 +20,10 @@ const MONGO_URI = process.env.MONGO_URI;
 app.use(cors({ origin: CLIENT_ORIGIN === "*" ? "*" : CLIENT_ORIGIN.split(","), credentials: true }));
 app.use(express.json({ limit: "1mb" }));
 
-function requestId() {
-  return `${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
-}
-
-function asyncRoute(handler) {
-  return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
-}
-
-function isValidObjectId(id) {
-  return mongoose.Types.ObjectId.isValid(String(id || ""));
-}
-
-app.use((req, res, next) => {
-  req.requestId = requestId();
-  const startedAt = Date.now();
-  res.on("finish", () => {
-    if (res.statusCode >= 400) {
-      console.error("[HTTP]", {
-        requestId: req.requestId,
-        method: req.method,
-        url: req.originalUrl,
-        statusCode: res.statusCode,
-        durationMs: Date.now() - startedAt,
-      });
-    }
-  });
-  next();
-});
-
-process.on("unhandledRejection", (err) => {
-  console.error("[UNHANDLED_REJECTION]", err);
-});
-
-process.on("uncaughtException", (err) => {
-  console.error("[UNCAUGHT_EXCEPTION]", err);
-});
-
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: CLIENT_ORIGIN === "*" ? "*" : CLIENT_ORIGIN.split(","), methods: ["GET", "POST"] },
   maxHttpBufferSize: 4 * 1024 * 1024,
-});
-
-["MONGO_URI", "JWT_SECRET"].forEach((name) => {
-  if (!process.env[name]) {
-    console.error("[CONFIG_MISSING]", name);
-  }
 });
 
 mongoose
@@ -88,39 +45,6 @@ function callIceServers() {
     servers.push({ urls: TURN_URLS, username: TURN_USERNAME, credential: TURN_CREDENTIAL });
   }
   return servers;
-}
-
-async function fetchSaavnJson(url, context = {}) {
-  const response = await fetch(url, { headers: { "User-Agent": "SyncWave/1.0" } });
-  const contentType = response.headers.get("content-type") || "";
-  const body = await response.text();
-  const preview = body.replace(/\s+/g, " ").trim().slice(0, 500);
-
-  console.log("[SAAVN_RESPONSE]", {
-    ...context,
-    status: response.status,
-    statusText: response.statusText,
-    contentType,
-    bodyPreview: preview,
-  });
-
-  if (!response.ok) {
-    const err = new Error(`Saavn upstream failed with ${response.status} ${response.statusText}`);
-    err.statusCode = 502;
-    err.upstreamStatus = response.status;
-    err.upstreamPreview = preview;
-    throw err;
-  }
-
-  try {
-    return JSON.parse(body);
-  } catch (err) {
-    err.statusCode = 502;
-    err.message = `Saavn upstream returned non-JSON response: ${err.message}`;
-    err.upstreamContentType = contentType;
-    err.upstreamPreview = preview;
-    throw err;
-  }
 }
 
 function publicUser(user) {
@@ -177,7 +101,7 @@ app.get("/api/auth/session", authRequired, (req, res) => {
   res.json({ user: publicUser(req.user) });
 });
 
-app.patch("/api/profile", authRequired, asyncRoute(async (req, res) => {
+app.patch("/api/profile", authRequired, async (req, res) => {
   const displayName = String(req.body.displayName || "").trim().slice(0, 60);
   const avatarUrl = String(req.body.avatarUrl || "").trim().slice(0, 1000);
   const user = await User.findByIdAndUpdate(
@@ -185,16 +109,14 @@ app.patch("/api/profile", authRequired, asyncRoute(async (req, res) => {
     { $set: { displayName: displayName || req.user.username, avatarUrl } },
     { new: true }
   );
-  if (!user) return res.status(404).json({ error: "User not found" });
   res.json({ user: publicUser(user) });
-}));
+});
 
-app.post("/api/profile/password", authRequired, asyncRoute(async (req, res) => {
+app.post("/api/profile/password", authRequired, async (req, res) => {
   const currentPassword = String(req.body.currentPassword || "");
   const nextPassword = String(req.body.nextPassword || "");
   if (nextPassword.length < 6) return res.status(400).json({ error: "New password must be at least 6 characters" });
   const user = await User.findById(req.user._id);
-  if (!user) return res.status(404).json({ error: "User not found" });
   const valid = await bcrypt.compare(currentPassword, user.passwordHash);
   if (!valid) return res.status(401).json({ error: "Current password is incorrect" });
   user.passwordHash = await bcrypt.hash(nextPassword, 12);
@@ -203,13 +125,13 @@ app.post("/api/profile/password", authRequired, asyncRoute(async (req, res) => {
   await user.save();
   io.to(req.user._id.toString()).emit("force_logout", { reason: "password_changed" });
   res.json({ ok: true });
-}));
+});
 
 app.get("/api/call/config", authRequired, (req, res) => {
   res.json({ iceServers: callIceServers() });
 });
 
-app.post("/api/auth/logout", authRequired, asyncRoute(async (req, res) => {
+app.post("/api/auth/logout", authRequired, async (req, res) => {
   const deviceId = String(req.body.deviceId || "");
   if (deviceId) {
     await User.updateOne(
@@ -218,17 +140,17 @@ app.post("/api/auth/logout", authRequired, asyncRoute(async (req, res) => {
     );
   }
   res.json({ ok: true });
-}));
+});
 
-app.get("/api/messages", authRequired, asyncRoute(async (req, res) => {
+app.get("/api/messages", authRequired, async (req, res) => {
   const messages = await Message.find({ accountId: req.user._id }).sort({ timestamp: -1 }).limit(80).lean();
   res.json({ messages: messages.reverse() });
-}));
+});
 
 function publicPlaylist(playlist) {
   return {
     id: playlist._id.toString(),
-    ownerAccountId: playlist.ownerAccountId?.toString?.() || "",
+    ownerAccountId: playlist.ownerAccountId.toString(),
     name: playlist.name,
     songs: playlist.songs || [],
     createdAt: playlist.createdAt,
@@ -255,12 +177,12 @@ function cleanSong(song) {
   };
 }
 
-app.get("/api/playlists", authRequired, asyncRoute(async (req, res) => {
+app.get("/api/playlists", authRequired, async (req, res) => {
   const playlists = await Playlist.find({ ownerAccountId: req.user._id }).sort({ updatedAt: -1 }).lean();
   res.json({ playlists: playlists.map(publicPlaylist) });
-}));
+});
 
-app.post("/api/playlists", authRequired, asyncRoute(async (req, res) => {
+app.post("/api/playlists", authRequired, async (req, res) => {
   const songs = Array.isArray(req.body.songs) ? req.body.songs.map(cleanSong).filter(Boolean).slice(0, 500) : [];
   const playlist = await Playlist.create({
     ownerAccountId: req.user._id,
@@ -269,10 +191,9 @@ app.post("/api/playlists", authRequired, asyncRoute(async (req, res) => {
     updatedAt: new Date(),
   });
   res.status(201).json({ playlist: publicPlaylist(playlist) });
-}));
+});
 
-app.patch("/api/playlists/:id", authRequired, asyncRoute(async (req, res) => {
-  if (!isValidObjectId(req.params.id)) return res.status(400).json({ error: "Invalid playlist id" });
+app.patch("/api/playlists/:id", authRequired, async (req, res) => {
   const patch = { updatedAt: new Date() };
   if (Object.prototype.hasOwnProperty.call(req.body, "name")) patch.name = cleanPlaylistName(req.body.name);
   if (Object.prototype.hasOwnProperty.call(req.body, "songs")) {
@@ -286,59 +207,36 @@ app.patch("/api/playlists/:id", authRequired, asyncRoute(async (req, res) => {
   ).lean();
   if (!playlist) return res.status(404).json({ error: "Playlist not found" });
   res.json({ playlist: publicPlaylist(playlist) });
-}));
+});
 
-app.delete("/api/playlists/:id", authRequired, asyncRoute(async (req, res) => {
-  if (!isValidObjectId(req.params.id)) return res.status(400).json({ error: "Invalid playlist id" });
+app.delete("/api/playlists/:id", authRequired, async (req, res) => {
   const deleted = await Playlist.findOneAndDelete({ _id: req.params.id, ownerAccountId: req.user._id }).lean();
   if (!deleted) return res.status(404).json({ error: "Playlist not found" });
   res.json({ ok: true });
-}));
+});
 
-app.post("/api/auth/logout-all", authRequired, asyncRoute(async (req, res) => {
+app.post("/api/auth/logout-all", authRequired, async (req, res) => {
   await User.updateOne(
     { _id: req.user._id },
     { $inc: { authVersion: 1 }, $set: { activeDevices: [] } }
   );
   io.to(req.user._id.toString()).emit("force_logout", { reason: "logout_all" });
   res.json({ ok: true });
-}));
+});
 
 app.get("/api/search", async (req, res) => {
   try {
     const { q, limit = 20, page = 0 } = req.query;
     if (!q) return res.status(400).json({ error: "query required" });
 
-    console.log("[SEARCH_REQUEST]", {
-      requestId: req.requestId,
-      query: { q, limit, page },
-    });
     const url = `${SAAVN_BASE}/api/search/songs?query=${encodeURIComponent(q)}&limit=${limit}&page=${page}`;
-    const data = await fetchSaavnJson(url, { route: "/api/search", requestId: req.requestId });
-    const rawResults = data.data?.results || [];
-    const songs = rawResults.map(formatSong).filter(Boolean);
-    console.log("[SEARCH_RESULTS]", {
-      requestId: req.requestId,
-      rawCount: rawResults.length,
-      parsedCount: songs.length,
-    });
+    const response = await fetch(url, { headers: { "User-Agent": "SyncWave/1.0" } });
+    const data = await response.json();
+    const songs = (data.data?.results || []).map(formatSong).filter(Boolean);
     res.json({ results: songs, total: data.data?.total || songs.length });
   } catch (err) {
-    console.error("[SEARCH_ERROR]", {
-      requestId: req.requestId,
-      query: req.query,
-      name: err.name,
-      message: err.message,
-      upstreamStatus: err.upstreamStatus,
-      upstreamContentType: err.upstreamContentType,
-      upstreamPreview: err.upstreamPreview,
-      stack: err.stack,
-    });
-    res.status(err.statusCode || 500).json({
-      error: err.statusCode === 502 ? "Search provider unavailable" : "Search failed",
-      details: err.message,
-      requestId: req.requestId,
-    });
+    console.error("Search error:", err.message);
+    res.status(500).json({ error: "Search failed", details: err.message });
   }
 });
 
@@ -354,8 +252,7 @@ app.get("/api/song/:id", async (req, res) => {
   }
 });
 
-app.get("/api/download/:id", authRequired, async (req, res, next) => {
-  if (req.params.id === "proxy") return next();
+app.get("/api/download/:id", authRequired, async (req, res) => {
   try {
     const url = `${SAAVN_BASE}/api/songs/${req.params.id}`;
     const response = await fetch(url, { headers: { "User-Agent": "SyncWave/1.0" } });
@@ -1069,32 +966,7 @@ io.on("connection", (socket) => {
   });
 });
 
-app.use((err, req, res, next) => {
-  const statusCode = err.statusCode || err.status || 500;
-  console.error("[HTTP_ERROR]", {
-    requestId: req.requestId,
-    method: req.method,
-    url: req.originalUrl,
-    statusCode,
-    name: err.name,
-    message: err.message,
-    stack: err.stack,
-  });
-  if (res.headersSent) return next(err);
-  res.status(statusCode).json({
-    error: statusCode >= 500 ? "Internal Server Error" : err.message,
-    requestId: req.requestId,
-  });
-});
-
-function registeredRoutes() {
-  return (app._router?.stack || [])
-    .filter((layer) => layer.route?.path)
-    .flatMap((layer) => Object.keys(layer.route.methods).map((method) => `${method.toUpperCase()} ${layer.route.path}`));
-}
-
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
   console.log(`SyncWave server running on :${PORT}`);
-  console.log("[SyncWave Routes]", registeredRoutes());
 });
