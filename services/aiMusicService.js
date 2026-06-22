@@ -5,14 +5,7 @@ const { buildSongPrompt } = require("./promptBuilder");
 const GEMINI_MODEL = process.env.GEMINI_MODEL;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const MAX_GEMINI_ATTEMPTS = 3;
-
-const THEME_SYNONYMS = {
-  love: ["love", "romance", "romantic", "relationship", "heart", "beloved", "affection", "mohabbat", "pyaar", "pyar", "\u092a\u094d\u092f\u093e\u0930", "\u092e\u094b\u0939\u092c\u094d\u092c\u0924"],
-  breakup: ["breakup", "separation", "heartbreak", "lost", "goodbye", "alone", "pain", "judai", "\u091c\u0941\u0926\u093e\u0908", "\u0926\u0930\u094d\u0926"],
-  gym: ["gym", "workout", "training", "discipline", "strength", "grind", "fitness", "motivation"],
-  party: ["party", "dance", "club", "celebration", "dhol", "beat", "night", "crowd"],
-  rain: ["rain", "barish", "\u092c\u093e\u0930\u093f\u0936", "monsoon", "cloud"],
-};
+const REQUIRED_SECTIONS = ["[Intro]", "[Verse 1]", "[Pre Chorus]", "[Chorus]", "[Verse 2]", "[Bridge]", "[Final Chorus]", "[Outro]"];
 
 function cleanText(value, max = 4000) {
   return String(value || "").trim().slice(0, max);
@@ -53,28 +46,6 @@ function lyricLines(lyrics) {
     .filter(Boolean);
 }
 
-function duplicateStats(lyrics) {
-  const lines = lyricLines(lyrics)
-    .map(normalizeLine)
-    .filter((line) => line && line.length > 2);
-  const counts = new Map();
-  lines.forEach((line) => counts.set(line, (counts.get(line) || 0) + 1));
-  let duplicateExtras = 0;
-  let repeatedLines = 0;
-  counts.forEach((count) => {
-    if (count > 1) {
-      duplicateExtras += count - 1;
-      repeatedLines += 1;
-    }
-  });
-  return {
-    totalLines: lines.length,
-    duplicateExtras,
-    repeatedLines,
-    duplicatePercentage: lines.length ? duplicateExtras / lines.length : 0,
-  };
-}
-
 function removeDuplicateLines(lyrics) {
   const seen = new Set();
   return lyricLines(lyrics).filter((line) => {
@@ -86,99 +57,18 @@ function removeDuplicateLines(lyrics) {
   }).join("\n");
 }
 
-function wordCount(text) {
-  return String(text || "").trim().split(/\s+/).filter(Boolean).length;
-}
-
-function stripSectionLabels(text) {
-  return String(text || "").replace(/\[[^\]]+\]/g, " ");
-}
-
-function hasDevanagari(text) {
-  return /[\u0900-\u097F]/.test(String(text || ""));
-}
-
-function hasGurmukhi(text) {
-  return /[\u0A00-\u0A7F]/.test(String(text || ""));
-}
-
-function latinWordCount(text) {
-  const stripped = stripSectionLabels(text);
-  return (stripped.match(/\b[A-Za-z]{2,}\b/g) || []).length;
-}
-
-function languageIssue(language, lyrics) {
-  const lang = String(language || "").toLowerCase();
-  if (lang === "hindi") {
-    if (!hasDevanagari(lyrics)) return "Hindi selected but lyrics are not in Devanagari";
-    if (latinWordCount(lyrics) > 3) return "Hindi selected but English/Roman words were detected";
-  }
-  if (lang === "punjabi") {
-    if (!hasGurmukhi(lyrics)) return "Punjabi selected but Gurmukhi Punjabi was not detected";
-    if (latinWordCount(lyrics) > 5) return "Punjabi selected but English/Roman words were detected";
-  }
-  if (lang === "english" && /[\u0900-\u097F\u0A00-\u0A7F]/.test(String(lyrics || ""))) {
-    return "English selected but Indic script was detected";
-  }
-  return "";
-}
-
-function themeTokens(prompt) {
-  const raw = String(prompt || "").toLowerCase();
-  const words = raw.match(/[\p{L}\p{N}]+/gu) || [];
-  const stop = new Set(["this", "that", "they", "call", "think", "song", "music", "about", "with", "from", "have", "will", "your", "their", "them", "mein", "meri", "tera", "teri"]);
-  const tokens = words.filter((word) => word.length > 2 && !stop.has(word)).slice(0, 12);
-  const expanded = new Set(tokens);
-  tokens.forEach((token) => {
-    Object.entries(THEME_SYNONYMS).forEach(([key, values]) => {
-      if (token === key || values.includes(token)) values.forEach((value) => expanded.add(value));
-    });
-  });
-  return Array.from(expanded);
-}
-
-function themeScore(input, generated) {
-  const tokens = themeTokens(input.prompt);
-  if (!tokens.length) return 1;
-  const haystack = [
-    generated.title,
-    generated.lyrics,
-    generated.musicPrompt,
-    generated.beatPrompt,
-    generated.coverPrompt,
-  ].join(" ").toLowerCase();
-  let hits = 0;
-  tokens.forEach((token) => {
-    if (haystack.includes(String(token).toLowerCase())) hits += 1;
-  });
-  return hits / Math.min(tokens.length, 6);
-}
-
-function genreIssue(input, generated) {
-  const genre = String(input.genre || "").toLowerCase();
-  const combined = [generated.lyrics, generated.musicPrompt, generated.beatPrompt].join(" ").toLowerCase();
-  if (genre === "bollywood") {
-    const bollywoodSignals = ["bollywood", "melody", "relationship", "romantic", "love", "cinematic", "piano", "strings", "tabla", "\u092a\u094d\u092f\u093e\u0930", "\u092e\u094b\u0939\u092c\u094d\u092c\u0924", "\u0926\u093f\u0932"];
-    if (!bollywoodSignals.some((signal) => combined.includes(signal))) return "Bollywood selected but lyrics/prompts do not reflect love, melody, relationships, or cinematic storytelling";
-  }
-  if (genre && !combined.includes(genre) && !["pop", "rock", "rap"].includes(genre)) {
-    return `${input.genre} selected but generated prompts barely reflect the genre`;
-  }
-  return "";
-}
-
-function qualityIssues(input, generated) {
-  const lyrics = generated.lyrics || "";
-  const beforeClean = duplicateStats(lyrics);
+function validationIssues(generated) {
   const issues = [];
-  if (wordCount(lyrics) < 260) issues.push("lyrics are too short");
-  if (beforeClean.repeatedLines > 3) issues.push("more than 3 repeated lines");
-  if (beforeClean.duplicatePercentage > 0.2) issues.push("duplicate percentage is above 20%");
-  const language = languageIssue(input.language, lyrics);
-  if (language) issues.push(language);
-  if (themeScore(input, generated) < 0.18) issues.push("lyrics/prompts are not related enough to the user theme");
-  const genre = genreIssue(input, generated);
-  if (genre) issues.push(genre);
+  if (!cleanText(generated?.title, 160)) issues.push("title missing");
+  const lyrics = cleanText(generated?.lyrics, 18000);
+  if (!lyrics) issues.push("lyrics missing");
+  if (lyrics.length <= 250) issues.push("lyrics length must be greater than 250 characters");
+  REQUIRED_SECTIONS.forEach((section) => {
+    if (!lyrics.includes(section)) issues.push(`${section} missing`);
+  });
+  if (!cleanText(generated?.musicPrompt, 4000)) issues.push("musicPrompt missing");
+  if (!cleanText(generated?.beatPrompt, 2500)) issues.push("beatPrompt missing");
+  if (!cleanText(generated?.coverPrompt, 2500)) issues.push("coverPrompt missing");
   return issues;
 }
 
@@ -270,6 +160,7 @@ function fallbackProject(input, reason = "") {
     beatPrompt: `${bpm} BPM ${genre} beat, ${mood.toLowerCase()} groove, ${instruments}, clear verse-to-chorus lift, no filler sections, strong transitions`,
     instrumentPrompt: instruments,
     coverPrompt: `Premium album cover for a ${genre} ${mood} song about "${prompt}", cinematic emotional focus, modern streaming artwork, no text, no logos`,
+    provider: "prompt-fallback",
   };
 }
 
@@ -313,26 +204,34 @@ async function requestGemini(input, attempt, repairInstructions) {
 }
 
 async function generateWithGemini(input) {
-  if (!GEMINI_API_KEY) return fallbackProject(input, "missing Gemini key");
-  let lastIssues = [];
+  if (!GEMINI_API_KEY) {
+    console.warn("FALLBACK_TRIGGERED", { reason: "missing Gemini key" });
+    return fallbackProject(input, "missing Gemini key");
+  }
+  let lastError = "";
   for (let attempt = 1; attempt <= MAX_GEMINI_ATTEMPTS; attempt += 1) {
     try {
-      const generated = await requestGemini(input, attempt, lastIssues.join("; "));
-      const issues = qualityIssues(input, generated);
-      if (!issues.length) {
-        return {
-          ...generated,
-          lyrics: removeDuplicateLines(generated.lyrics),
-        };
+      const generated = await requestGemini(input, attempt, lastError);
+      const issues = validationIssues(generated);
+      if (issues.length) {
+        console.warn("VALIDATION_FAILED", { attempt, issues });
+        lastError = issues.join("; ");
+        continue;
       }
-      lastIssues = issues;
-      console.warn("[AI Quality] rejected Gemini attempt", { attempt, issues });
+      console.log("VALIDATION_PASSED", { attempt, title: generated.title });
+      console.log("SAVED_GEMINI_RESPONSE", {
+        attempt,
+        title: generated.title,
+        lyricsChars: generated.lyrics.length,
+      });
+      return { ...generated, provider: "gemini" };
     } catch (err) {
-      lastIssues = [err.message];
+      lastError = err.message;
       console.error("[AI Gemini] attempt failed", { attempt, error: err.message });
     }
   }
-  return fallbackProject(input, lastIssues.join("; "));
+  console.warn("FALLBACK_TRIGGERED", { reason: lastError || "Gemini returned empty or invalid response" });
+  return fallbackProject(input, lastError || "Gemini returned empty or invalid response");
 }
 
 function pollinationsCoverUrl(coverPrompt) {
@@ -396,7 +295,7 @@ async function createAiProject(input) {
     cloudinaryPublicId: cloudinary?.publicId || "",
     audioUrl: "",
     status: "metadata_ready",
-    provider: GEMINI_API_KEY ? "gemini" : "prompt-fallback",
+    provider: generated.provider || (GEMINI_API_KEY ? "gemini" : "prompt-fallback"),
     seed: projectSeed({ input, generated }),
     workers: workerStatus(),
   };
@@ -405,7 +304,5 @@ async function createAiProject(input) {
 module.exports = {
   createAiProject,
   workerStatus,
-  qualityIssues,
-  removeDuplicateLines,
-  themeScore,
+  validationIssues,
 };
