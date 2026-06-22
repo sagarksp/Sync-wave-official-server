@@ -2,8 +2,8 @@ const crypto = require("crypto");
 const fetch = require("node-fetch");
 const { buildSongPrompt } = require("./promptBuilder");
 
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-1.5-flash";
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+const GEMINI_MODEL = process.env.GEMINI_MODEL;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const MAX_GEMINI_ATTEMPTS = 3;
 
 const THEME_SYNONYMS = {
