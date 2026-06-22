@@ -2,6 +2,8 @@ require("dotenv").config();
 
 const express = require("express");
 const http = require("http");
+const fs = require("fs");
+const path = require("path");
 const { Server } = require("socket.io");
 const cors = require("cors");
 const fetch = require("node-fetch");
@@ -12,18 +14,38 @@ const User = require("./models/User");
 const Message = require("./models/Message");
 const Playlist = require("./models/Playlist");
 const { authRequired, signToken, JWT_SECRET } = require("./middleware/auth");
+const aiMusicRoutes = require("./routes/aiMusic");
 
 const app = express();
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "*";
 const MONGO_URI = process.env.MONGO_URI;
 
-app.use(cors({ origin: CLIENT_ORIGIN === "*" ? "*" : CLIENT_ORIGIN.split(","), credentials: true }));
-app.use(express.json({ limit: "1mb" }));
+const configuredOrigins = CLIENT_ORIGIN === "*"
+  ? "*"
+  : CLIENT_ORIGIN.split(",").map((origin) => origin.trim()).filter(Boolean);
+
+function corsOrigin(origin, callback) {
+  if (!origin || configuredOrigins === "*" || configuredOrigins.includes(origin) || /^http:\/\/localhost:\d+$/.test(origin)) {
+    callback(null, true);
+    return;
+  }
+  callback(new Error(`Origin not allowed: ${origin}`));
+}
+
+app.use(cors({ origin: corsOrigin, credentials: true }));
+app.use(express.json({ limit: "35mb" }));
+
+const chatUploadDir = path.join(__dirname, "uploads", "chat");
+fs.mkdirSync(chatUploadDir, { recursive: true });
+app.use("/chat-uploads", express.static(chatUploadDir, {
+  immutable: true,
+  maxAge: "30d",
+}));
 
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: CLIENT_ORIGIN === "*" ? "*" : CLIENT_ORIGIN.split(","), methods: ["GET", "POST"] },
-  maxHttpBufferSize: 4 * 1024 * 1024,
+  cors: { origin: corsOrigin, methods: ["GET", "POST"] },
+  maxHttpBufferSize: 8 * 1024 * 1024,
 });
 
 mongoose
@@ -146,6 +168,39 @@ app.get("/api/messages", authRequired, async (req, res) => {
   const messages = await Message.find({ accountId: req.user._id }).sort({ timestamp: -1 }).limit(80).lean();
   res.json({ messages: messages.reverse() });
 });
+
+app.post("/api/chat/attachments", authRequired, async (req, res) => {
+  try {
+    const name = String(req.body.name || "attachment").slice(0, 180);
+    const size = Math.max(0, Number(req.body.size) || 0);
+    const encryptedDataUrl = String(req.body.encryptedDataUrl || "");
+    console.log("[SyncWave Chat] ATTACHMENT_UPLOAD_REQUEST", {
+      userId: req.user._id.toString(),
+      name,
+      size,
+      encryptedBytes: encryptedDataUrl.length,
+    });
+
+    const match = encryptedDataUrl.match(/^data:application\/octet-stream;base64,([A-Za-z0-9+/=]+)$/);
+    if (!match) return res.status(400).json({ error: "Encrypted attachment payload required" });
+    if (size > 25 * 1024 * 1024) return res.status(400).json({ error: "Attachment exceeds 25 MB" });
+
+    const buffer = Buffer.from(match[1], "base64");
+    const filename = `${req.user._id}-${Date.now()}-${Math.random().toString(16).slice(2)}.bin`;
+    const target = path.join(chatUploadDir, filename);
+    await fs.promises.writeFile(target, buffer);
+    console.log("[SyncWave Chat] ATTACHMENT_UPLOADED", { filename, encryptedSize: buffer.length });
+    res.status(201).json({
+      fileUrl: `/chat-uploads/${filename}`,
+      encryptedSize: buffer.length,
+    });
+  } catch (err) {
+    console.error("[SyncWave Chat] ATTACHMENT_UPLOAD_FAILED", err.stack || err.message);
+    res.status(500).json({ error: "Attachment upload failed" });
+  }
+});
+
+app.use("/api/ai", aiMusicRoutes);
 
 function publicPlaylist(playlist) {
   return {
@@ -431,7 +486,40 @@ function statePayload(session) {
 function emitState(accountId) {
   const session = sessions[accountId];
   if (!session) return;
-  io.to(accountId).emit("state_update", statePayload(session));
+  const payload = statePayload(session);
+  console.log("[SyncWave Sync] STATE BROADCAST", {
+    accountId,
+    mode: "room",
+    action: payload.lastAction,
+    currentSong: payload.currentSong?.title,
+    isPlaying: payload.isPlaying,
+    position: payload.position,
+    queueLength: payload.queue?.length || 0,
+    syncEnabled: payload.syncEnabled,
+  });
+  io.to(accountId).emit("state_update", payload);
+}
+
+function emitPlaybackState(socket, accountId) {
+  const session = sessions[accountId];
+  if (!session) return;
+  const payload = statePayload(session);
+  console.log("[SyncWave Sync] STATE BROADCAST", {
+    accountId,
+    mode: session.state.syncEnabled ? "room" : "socket",
+    socketId: socket.id,
+    action: payload.lastAction,
+    currentSong: payload.currentSong?.title,
+    isPlaying: payload.isPlaying,
+    position: payload.position,
+    queueLength: payload.queue?.length || 0,
+    syncEnabled: payload.syncEnabled,
+  });
+  if (session.state.syncEnabled) {
+    io.to(accountId).emit("state_update", payload);
+  } else {
+    socket.emit("state_update", payload);
+  }
 }
 
 function emitDeviceEvent(accountId, type, deviceName) {
@@ -657,80 +745,134 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("play_song", ({ song }) => {
-    if (!currentAccountId || !song) return;
+  socket.on("play_song", ({ song }, ack) => {
+    console.log("play_song received", { deviceName: currentDeviceName, socketId: socket.id, song });
+    if (!currentAccountId || !song) {
+      ack?.({ ok: false, error: "Missing session or song" });
+      return;
+    }
     const session = sessions[currentAccountId];
+    console.log("[SyncWave Player] play_song received", {
+      deviceName: currentDeviceName,
+      songId: song.id,
+      title: song.title,
+      hasStreamUrl: Boolean(song.streamUrl),
+      syncEnabled: session.state.syncEnabled,
+    });
     session.state.currentSong = song;
     setPlaybackCheckpoint(session, 0, true);
     if (!session.state.queue.find((s) => s.id === song.id)) {
       session.state.queue = [song, ...session.state.queue].slice(0, 100);
     }
     markStateAction(session, "SONG_CHANGE", currentDeviceId, currentDeviceName);
-    console.log("[SyncWave Sync] STATE_UPDATE", { action: "SONG_CHANGE", deviceName: currentDeviceName, serverPosition: getLivePosition(session) });
-    if (session.state.syncEnabled) emitState(currentAccountId);
+    console.log("[SyncWave Sync] STATE UPDATED", statePayload(session));
+    emitPlaybackState(socket, currentAccountId);
+    ack?.({ ok: true, action: "SONG_CHANGE", currentSong: session.state.currentSong?.title, queueLength: session.state.queue.length });
   });
 
-  socket.on("play_pause", ({ isPlaying }) => {
-    if (!currentAccountId) return;
+  socket.on("play_pause", ({ isPlaying }, ack) => {
+    console.log("play_pause received", { deviceName: currentDeviceName, socketId: socket.id, isPlaying });
+    if (!currentAccountId) {
+      ack?.({ ok: false, error: "Missing session" });
+      return;
+    }
     const session = sessions[currentAccountId];
     const livePos = getLivePosition(session);
     setPlaybackCheckpoint(session, livePos, Boolean(isPlaying));
     markStateAction(session, session.state.isPlaying ? "PLAY" : "PAUSE", currentDeviceId, currentDeviceName);
-    console.log("[SyncWave Sync] STATE_UPDATE", { action: session.state.lastAction, deviceName: currentDeviceName, serverPosition: getLivePosition(session) });
-    if (session.state.syncEnabled) emitState(currentAccountId);
+    console.log("[SyncWave Player]", session.state.isPlaying ? "play triggered" : "pause triggered", { deviceName: currentDeviceName, serverPosition: getLivePosition(session), syncEnabled: session.state.syncEnabled });
+    emitPlaybackState(socket, currentAccountId);
+    ack?.({ ok: true, action: session.state.isPlaying ? "PLAY" : "PAUSE", isPlaying: session.state.isPlaying });
   });
 
-  socket.on("seek", ({ position }) => {
-    if (!currentAccountId) return;
+  socket.on("seek", ({ position }, ack) => {
+    console.log("seek received", { deviceName: currentDeviceName, socketId: socket.id, position });
+    if (!currentAccountId) {
+      ack?.({ ok: false, error: "Missing session" });
+      return;
+    }
     const session = sessions[currentAccountId];
     setPlaybackCheckpoint(session, position, session.state.isPlaying);
     markStateAction(session, "SEEK", currentDeviceId, currentDeviceName);
     console.log("[SyncWave Sync] SEEK_RECEIVED", { deviceName: currentDeviceName, position: session.state.positionAtPlay });
-    console.log("[SyncWave Sync] STATE_UPDATE", { action: "SEEK", deviceName: currentDeviceName, serverPosition: getLivePosition(session) });
-    if (session.state.syncEnabled) emitState(currentAccountId);
+    console.log("[SyncWave Player] seek triggered", { action: "SEEK", deviceName: currentDeviceName, serverPosition: getLivePosition(session), syncEnabled: session.state.syncEnabled });
+    emitPlaybackState(socket, currentAccountId);
+    ack?.({ ok: true, action: "SEEK", position: session.state.positionAtPlay });
   });
 
-  socket.on("next_song", () => {
-    if (!currentAccountId) return;
+  socket.on("next_song", (_payload, ack) => {
+    if (!currentAccountId) {
+      ack?.({ ok: false, error: "Missing session" });
+      return;
+    }
     const session = sessions[currentAccountId];
-    if (!session.state.queue.length) return;
+    if (!session.state.queue.length) {
+      ack?.({ ok: false, error: "Queue is empty" });
+      return;
+    }
     const idx = session.state.queue.findIndex((s) => s.id === session.state.currentSong?.id);
     const next = session.state.queue[(idx + 1) % session.state.queue.length];
-    if (!next) return;
+    if (!next) {
+      ack?.({ ok: false, error: "Next song not found" });
+      return;
+    }
     session.state.currentSong = next;
     setPlaybackCheckpoint(session, 0, true);
     markStateAction(session, "NEXT", currentDeviceId, currentDeviceName);
-    console.log("[SyncWave Sync] STATE_UPDATE", { action: "NEXT", deviceName: currentDeviceName, serverPosition: getLivePosition(session) });
-    if (session.state.syncEnabled) emitState(currentAccountId);
+    console.log("[SyncWave Player] currentSong updated", { action: "NEXT", deviceName: currentDeviceName, title: next.title, serverPosition: getLivePosition(session), syncEnabled: session.state.syncEnabled });
+    emitPlaybackState(socket, currentAccountId);
+    ack?.({ ok: true, action: "NEXT", currentSong: next.title });
   });
 
-  socket.on("prev_song", () => {
-    if (!currentAccountId) return;
+  socket.on("prev_song", (_payload, ack) => {
+    if (!currentAccountId) {
+      ack?.({ ok: false, error: "Missing session" });
+      return;
+    }
     const session = sessions[currentAccountId];
-    if (!session.state.queue.length) return;
+    if (!session.state.queue.length) {
+      ack?.({ ok: false, error: "Queue is empty" });
+      return;
+    }
     const idx = session.state.queue.findIndex((s) => s.id === session.state.currentSong?.id);
     const prev = session.state.queue[(idx - 1 + session.state.queue.length) % session.state.queue.length];
-    if (!prev) return;
+    if (!prev) {
+      ack?.({ ok: false, error: "Previous song not found" });
+      return;
+    }
     session.state.currentSong = prev;
     setPlaybackCheckpoint(session, 0, true);
     markStateAction(session, "PREV", currentDeviceId, currentDeviceName);
-    console.log("[SyncWave Sync] STATE_UPDATE", { action: "PREV", deviceName: currentDeviceName, serverPosition: getLivePosition(session) });
-    if (session.state.syncEnabled) emitState(currentAccountId);
+    console.log("[SyncWave Player] currentSong updated", { action: "PREV", deviceName: currentDeviceName, title: prev.title, serverPosition: getLivePosition(session), syncEnabled: session.state.syncEnabled });
+    emitPlaybackState(socket, currentAccountId);
+    ack?.({ ok: true, action: "PREV", currentSong: prev.title });
   });
 
-  socket.on("set_queue", ({ queue }) => {
-    if (!currentAccountId || !Array.isArray(queue)) return;
+  socket.on("set_queue", ({ queue }, ack) => {
+    console.log("set_queue received", { deviceName: currentDeviceName, socketId: socket.id, count: Array.isArray(queue) ? queue.length : "invalid" });
+    if (!currentAccountId || !Array.isArray(queue)) {
+      ack?.({ ok: false, error: "Missing session or queue" });
+      return;
+    }
     const session = sessions[currentAccountId];
     session.state.queue = queue.filter(Boolean).slice(0, 100);
     markStateAction(session, "QUEUE", currentDeviceId, currentDeviceName);
-    if (session.state.syncEnabled) emitState(currentAccountId);
+    console.log("[SyncWave Sync] STATE UPDATED", statePayload(session));
+    emitPlaybackState(socket, currentAccountId);
+    ack?.({ ok: true, action: "QUEUE", queueLength: session.state.queue.length });
   });
 
-  socket.on("volume_change", ({ volume }) => {
-    if (!currentAccountId) return;
+  socket.on("volume_change", ({ volume }, ack) => {
+    console.log("volume_change received", { deviceName: currentDeviceName, socketId: socket.id, volume });
+    if (!currentAccountId) {
+      ack?.({ ok: false, error: "Missing session" });
+      return;
+    }
     const session = sessions[currentAccountId];
     session.state.volume = Math.max(0, Math.min(100, Number(volume) || 0));
-    if (session.state.syncEnabled) emitState(currentAccountId);
+    markStateAction(session, "VOLUME", currentDeviceId, currentDeviceName);
+    emitPlaybackState(socket, currentAccountId);
+    ack?.({ ok: true, volume: session.state.volume });
   });
 
   socket.on("toggle_sync", ({ syncEnabled }) => {
@@ -740,26 +882,113 @@ io.on("connection", (socket) => {
     emitState(currentAccountId);
   });
 
-  socket.on("chat_message", async ({ message, attachments }) => {
-    if (!currentAccountId) return;
-    const text = String(message || "").trim().slice(0, 1000);
-    const cleanAttachments = Array.isArray(attachments)
-      ? attachments.slice(0, 4).map((item) => ({
-        name: String(item.name || "Attachment").slice(0, 120),
-        type: String(item.type || "application/octet-stream").slice(0, 120),
-        size: Math.max(0, Number(item.size) || 0),
-        dataUrl: String(item.dataUrl || "").slice(0, 900000),
-      })).filter((item) => item.dataUrl.startsWith("data:"))
-      : [];
-    if (!text && !cleanAttachments.length) return;
-    const saved = await Message.create({
-      accountId: currentAccountId,
-      deviceName: currentDeviceName || "Unknown Device",
-      message: text || (cleanAttachments.length ? "Attachment" : ""),
-      attachments: cleanAttachments,
-      timestamp: new Date(),
-    });
-    io.to(currentAccountId).emit("chat_message", saved);
+  socket.on("chat_message", async ({ message, encrypted, encryptedMessage, attachments, replyTo } = {}, ack) => {
+    try {
+      console.log("[SyncWave Chat] MESSAGE_SENT", {
+        accountId: currentAccountId,
+        deviceName: currentDeviceName,
+        encrypted: Boolean(encrypted),
+        hasText: Boolean(message || encryptedMessage?.data),
+        attachments: Array.isArray(attachments) ? attachments.length : 0,
+        replyToId: replyTo?.messageId || "",
+      });
+      if (!currentAccountId) {
+        ack?.({ ok: false, error: "Missing chat session" });
+        return;
+      }
+      const isEncrypted = Boolean(encrypted);
+      const text = isEncrypted ? "[encrypted]" : String(message || "").trim().slice(0, 1000);
+      const cleanEncryptedMessage = isEncrypted ? {
+        iv: String(encryptedMessage?.iv || "").slice(0, 80),
+        data: String(encryptedMessage?.data || "").slice(0, 20000),
+      } : { iv: "", data: "" };
+      const cleanAttachments = Array.isArray(attachments)
+        ? attachments.slice(0, 4).map((item) => ({
+          name: String(item.name || "Attachment").slice(0, 180),
+          type: String(item.type || "application/octet-stream").slice(0, 160),
+          size: Math.max(0, Number(item.size) || 0),
+          dataUrl: String(item.dataUrl || "").slice(0, 900000),
+          fileUrl: String(item.fileUrl || "").slice(0, 500),
+          encrypted: Boolean(item.encrypted),
+          iv: String(item.iv || "").slice(0, 80),
+          encryptedName: {
+            iv: String(item.encryptedName?.iv || "").slice(0, 80),
+            data: String(item.encryptedName?.data || "").slice(0, 2000),
+          },
+          encryptedType: {
+            iv: String(item.encryptedType?.iv || "").slice(0, 80),
+            data: String(item.encryptedType?.data || "").slice(0, 1000),
+          },
+        })).filter((item) => item.fileUrl || item.dataUrl.startsWith("data:"))
+        : [];
+      const cleanReply = replyTo?.messageId ? {
+        messageId: String(replyTo.messageId || "").slice(0, 80),
+        sender: {
+          iv: String(replyTo.sender?.iv || "").slice(0, 80),
+          data: String(replyTo.sender?.data || "").slice(0, 2000),
+        },
+        text: {
+          iv: String(replyTo.text?.iv || "").slice(0, 80),
+          data: String(replyTo.text?.data || "").slice(0, 4000),
+        },
+      } : undefined;
+
+      if (!text && !cleanEncryptedMessage.data && !cleanAttachments.length) {
+        ack?.({ ok: false, error: "Empty chat message" });
+        return;
+      }
+      const saved = await Message.create({
+        accountId: currentAccountId,
+        deviceName: currentDeviceName || "Unknown Device",
+        message: text || (cleanAttachments.length ? "[encrypted attachment]" : ""),
+        encrypted: isEncrypted,
+        encryptedMessage: cleanEncryptedMessage,
+        replyTo: cleanReply,
+        attachments: cleanAttachments,
+        timestamp: new Date(),
+      });
+      console.log("[SyncWave Chat] MESSAGE_RECEIVED", { messageId: saved._id.toString(), attachments: cleanAttachments.length });
+      io.to(currentAccountId).emit("chat_message", saved);
+      ack?.({ ok: true, messageId: saved._id.toString() });
+    } catch (err) {
+      console.error("[SyncWave Chat] MESSAGE_SEND_FAILED", err.stack || err.message);
+      ack?.({ ok: false, error: "Message send failed" });
+    }
+  });
+
+  socket.on("chat_reaction", async ({ messageId, emoji } = {}, ack) => {
+    try {
+      if (!currentAccountId || !currentDeviceId) {
+        ack?.({ ok: false, error: "Missing chat session" });
+        return;
+      }
+      const allowed = ["👍", "❤️", "😂", "😮", "😢", "🔥", "🎵"];
+      if (!allowed.includes(emoji)) {
+        ack?.({ ok: false, error: "Unsupported reaction" });
+        return;
+      }
+      const id = String(messageId || "");
+      const reaction = {
+        emoji,
+        deviceId: currentDeviceId,
+        deviceName: currentDeviceName || "Unknown Device",
+        reactedAt: new Date(),
+      };
+      await Message.updateOne(
+        { _id: id, accountId: currentAccountId },
+        { $pull: { reactions: { deviceId: currentDeviceId, emoji } } }
+      );
+      await Message.updateOne(
+        { _id: id, accountId: currentAccountId },
+        { $push: { reactions: reaction } }
+      );
+      console.log("[SyncWave Chat] REACTION_ADDED", { messageId: id, emoji, deviceName: currentDeviceName });
+      io.to(currentAccountId).emit("message_reaction", { messageId: id, reaction });
+      ack?.({ ok: true });
+    } catch (err) {
+      console.error("[SyncWave Chat] REACTION_FAILED", err.stack || err.message);
+      ack?.({ ok: false, error: "Reaction failed" });
+    }
   });
 
   socket.on("chat_seen", async ({ messageIds } = {}) => {
