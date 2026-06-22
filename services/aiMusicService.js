@@ -3,7 +3,7 @@ const fetch = require("node-fetch");
 const { buildSongPrompt } = require("./promptBuilder");
 
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-1.5-flash";
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "AQ.Ab8RN6JOudHEDPxHRTTZCtObupVKi7CN8PBbE_U6PNmHJl1D8Q";
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const MAX_GEMINI_ATTEMPTS = 3;
 
 const THEME_SYNONYMS = {
