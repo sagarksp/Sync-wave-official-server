@@ -2,6 +2,7 @@ const express = require("express");
 const AISong = require("../models/AISong");
 const { authRequired } = require("../middleware/auth");
 const { createAiProject, workerStatus } = require("../services/aiMusicService");
+const pipelineRoutes = require("./aiMusic.routes");
 
 const router = express.Router();
 
@@ -131,5 +132,7 @@ router.post("/generate", authRequired, async (req, res) => {
     res.status(500).json({ error: "Unable to generate song project" });
   }
 });
+
+router.use("/", pipelineRoutes);
 
 module.exports = router;

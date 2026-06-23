@@ -15,6 +15,7 @@ const Message = require("./models/Message");
 const Playlist = require("./models/Playlist");
 const { authRequired, signToken, JWT_SECRET } = require("./middleware/auth");
 const aiMusicRoutes = require("./routes/aiMusic");
+const ttsRoutes = require("./routes/tts.routes");
 
 const app = express();
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "*";
@@ -36,8 +37,14 @@ app.use(cors({ origin: corsOrigin, credentials: true }));
 app.use(express.json({ limit: "35mb" }));
 
 const chatUploadDir = path.join(__dirname, "uploads", "chat");
+const generatedUploadDir = path.join(__dirname, "uploads", "generated");
 fs.mkdirSync(chatUploadDir, { recursive: true });
+fs.mkdirSync(generatedUploadDir, { recursive: true });
 app.use("/chat-uploads", express.static(chatUploadDir, {
+  immutable: true,
+  maxAge: "30d",
+}));
+app.use("/generated", express.static(generatedUploadDir, {
   immutable: true,
   maxAge: "30d",
 }));
@@ -47,6 +54,7 @@ const io = new Server(server, {
   cors: { origin: corsOrigin, methods: ["GET", "POST"] },
   maxHttpBufferSize: 8 * 1024 * 1024,
 });
+app.set("io", io);
 
 mongoose
   .connect(MONGO_URI)
@@ -201,6 +209,7 @@ app.post("/api/chat/attachments", authRequired, async (req, res) => {
 });
 
 app.use("/api/ai", aiMusicRoutes);
+app.use("/api/tts", ttsRoutes);
 
 function publicPlaylist(playlist) {
   return {
@@ -882,7 +891,7 @@ io.on("connection", (socket) => {
     emitState(currentAccountId);
   });
 
-  socket.on("chat_message", async ({ message, encrypted, encryptedMessage, attachments, replyTo } = {}, ack) => {
+  socket.on("chat_message", async ({ message, encrypted, encryptedMessage, notificationPreview, attachments, replyTo } = {}, ack) => {
     try {
       console.log("[SyncWave Chat] MESSAGE_SENT", {
         accountId: currentAccountId,
@@ -897,6 +906,7 @@ io.on("connection", (socket) => {
         return;
       }
       const isEncrypted = Boolean(encrypted);
+      const originalText = String(notificationPreview || message || "").trim().slice(0, 1000);
       const text = isEncrypted ? "[encrypted]" : String(message || "").trim().slice(0, 1000);
       const cleanEncryptedMessage = isEncrypted ? {
         iv: String(encryptedMessage?.iv || "").slice(0, 80),
@@ -948,7 +958,12 @@ io.on("connection", (socket) => {
         timestamp: new Date(),
       });
       console.log("[SyncWave Chat] MESSAGE_RECEIVED", { messageId: saved._id.toString(), attachments: cleanAttachments.length });
-      io.to(currentAccountId).emit("chat_message", saved);
+      const notificationBody = originalText || (cleanAttachments.length ? "Attachment" : "");
+      const outgoingMessage = saved.toObject ? saved.toObject() : saved;
+      outgoingMessage.notificationPreview = notificationBody;
+      console.log("NOTIFICATION_BODY", { messageId: saved._id.toString(), body: notificationBody });
+      console.log("NOTIFICATION_SENT", { messageId: saved._id.toString(), body: notificationBody, accountId: currentAccountId });
+      io.to(currentAccountId).emit("chat_message", outgoingMessage);
       ack?.({ ok: true, messageId: saved._id.toString() });
     } catch (err) {
       console.error("[SyncWave Chat] MESSAGE_SEND_FAILED", err.stack || err.message);

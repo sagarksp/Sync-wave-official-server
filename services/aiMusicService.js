@@ -2,9 +2,9 @@ const crypto = require("crypto");
 const fetch = require("node-fetch");
 const { buildSongPrompt } = require("./promptBuilder");
 
-const GEMINI_MODEL = process.env.GEMINI_MODEL;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const MAX_GEMINI_ATTEMPTS = 3;
+const MAX_GEMINI_ATTEMPTS = 2;
 const REQUIRED_SECTIONS = ["[Intro]", "[Verse 1]", "[Pre Chorus]", "[Chorus]", "[Verse 2]", "[Bridge]", "[Final Chorus]", "[Outro]"];
 
 function cleanText(value, max = 4000) {
@@ -17,17 +17,7 @@ function safeJsonParse(text) {
     .replace(/^```(?:json)?/i, "")
     .replace(/```$/i, "")
     .trim();
-  try {
-    return JSON.parse(cleaned);
-  } catch (err) {
-    const match = cleaned.match(/\{[\s\S]*\}/);
-    if (!match) return null;
-    try {
-      return JSON.parse(match[0]);
-    } catch (innerErr) {
-      return null;
-    }
-  }
+  return JSON.parse(cleaned);
 }
 
 function normalizeLine(line) {
@@ -197,9 +187,15 @@ async function requestGemini(input, attempt, repairInstructions) {
   console.log("[AI Debug] Raw Gemini Response", JSON.stringify(data).slice(0, 14000));
   if (!response.ok) throw new Error(data.error?.message || `Gemini failed with ${response.status}`);
   const text = data.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("\n") || "";
-  const parsed = safeJsonParse(text);
-  console.log("[AI Debug] Parsed Response", parsed ? JSON.stringify(parsed).slice(0, 10000) : "null");
-  if (!parsed) throw new Error("Gemini returned unparsable JSON");
+  let parsed = null;
+  try {
+    parsed = safeJsonParse(text);
+  } catch (err) {
+    console.error("[AI Debug] Gemini JSON parse failed", { error: err.message, rawText: text.slice(0, 4000) });
+    throw new Error("Gemini returned invalid JSON");
+  }
+  console.log("[AI Debug] Parsed Response", JSON.stringify(parsed).slice(0, 10000));
+  if (!parsed || typeof parsed !== "object") throw new Error("Gemini returned empty JSON");
   return sanitizeParsed(parsed);
 }
 
@@ -235,7 +231,7 @@ async function generateWithGemini(input) {
 }
 
 function pollinationsCoverUrl(coverPrompt) {
-  const prompt = cleanText(coverPrompt, 1200) || "premium music album cover";
+  const prompt = `${cleanText(coverPrompt, 1100) || "premium music album cover"}, no text, no logos`;
   return `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=1024&height=1024&nologo=true`;
 }
 
