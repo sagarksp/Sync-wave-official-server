@@ -11,28 +11,29 @@ function clean(value, max = 2000) {
 }
 
 function publicAiSong(song) {
+  if (!song) return null;
   return {
-    id: song._id.toString(),
+    id: song._id?.toString?.() || song.id || "",
     userId: song.userId?.toString?.() || "",
-    title: song.title,
-    lyrics: song.lyrics,
-    prompt: song.prompt,
-    genre: song.genre,
-    mood: song.mood,
-    voice: song.voice,
-    language: song.language,
-    bpm: song.bpm,
-    tempo: song.tempo,
-    energy: song.energy,
-    instruments: song.instruments,
-    musicPrompt: song.musicPrompt,
-    beatPrompt: song.beatPrompt,
-    instrumentPrompt: song.instrumentPrompt,
-    coverPrompt: song.coverPrompt,
-    coverImage: song.coverImage,
-    audioUrl: song.audioUrl,
-    status: song.status,
-    provider: song.provider,
+    title: clean(song.title, 160),
+    lyrics: clean(song.lyrics, 18000),
+    prompt: clean(song.prompt, 2000),
+    genre: clean(song.genre, 80),
+    mood: clean(song.mood, 80),
+    voice: clean(song.voice, 80),
+    language: clean(song.language, 80),
+    bpm: Number(song.bpm) || 0,
+    tempo: clean(song.tempo, 80),
+    energy: clean(song.energy, 80),
+    instruments: clean(song.instruments, 240),
+    musicPrompt: clean(song.musicPrompt, 4000),
+    beatPrompt: clean(song.beatPrompt, 2500),
+    instrumentPrompt: clean(song.instrumentPrompt, 2000),
+    coverPrompt: clean(song.coverPrompt, 2500),
+    coverImage: clean(song.coverImage, 4000),
+    audioUrl: clean(song.audioUrl, 1000),
+    status: clean(song.status, 80),
+    provider: clean(song.provider, 120),
     createdAt: song.createdAt,
     updatedAt: song.updatedAt,
   };
@@ -49,7 +50,7 @@ router.get("/workers", authRequired, (req, res) => {
 router.get("/songs", authRequired, async (req, res) => {
   try {
     const songs = await AISong.find({ userId: req.user._id }).sort({ createdAt: -1 }).limit(100).lean();
-    res.json({ songs: songs.map(publicAiSong) });
+    res.json({ songs: songs.map(publicAiSong).filter(Boolean) });
   } catch (err) {
     console.error("[AI Songs] list failed", err.message);
     res.status(500).json({ error: "Unable to load AI songs" });

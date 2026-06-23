@@ -21,24 +21,39 @@ function clean(value, max = 2000) {
 }
 
 function publicSong(song) {
+  if (!song) return null;
   return {
     id: song._id?.toString?.() || song.id || "",
-    title: song.title,
-    lyrics: song.lyrics,
-    prompt: song.prompt,
-    genre: song.genre,
-    mood: song.mood,
-    language: song.language,
-    voice: song.voice,
-    coverImage: song.coverImage,
-    instrumentalUrl: song.instrumentalUrl,
-    vocalsUrl: song.vocalsUrl,
-    finalSongUrl: song.finalSongUrl,
-    audioUrl: song.audioUrl || song.finalSongUrl,
+    title: clean(song.title, 160),
+    lyrics: clean(song.lyrics, 18000),
+    prompt: clean(song.prompt, 2000),
+    genre: clean(song.genre, 80),
+    mood: clean(song.mood, 80),
+    language: clean(song.language, 80),
+    voice: clean(song.voice, 80),
+    coverImage: clean(song.coverImage, 4000),
+    instrumentalUrl: clean(song.instrumentalUrl, 1000),
+    vocalsUrl: clean(song.vocalsUrl, 1000),
+    finalSongUrl: clean(song.finalSongUrl, 1000),
+    audioUrl: clean(song.audioUrl || song.finalSongUrl, 1000),
     duration: song.duration || 0,
-    status: song.status,
+    status: clean(song.status, 80),
     createdBy: song.createdBy?.toString?.() || song.userId?.toString?.() || "",
     createdAt: song.createdAt,
+  };
+}
+
+function publicJob(job) {
+  return {
+    jobId: clean(job?.jobId, 80),
+    status: clean(job?.status, 80),
+    step: clean(job?.step, 120),
+    progress: Math.max(0, Math.min(100, Number(job?.progress) || 0)),
+    error: clean(job?.error, 1000),
+    song: publicSong(job?.song),
+    songId: clean(job?.songId, 80),
+    createdAt: job?.createdAt || null,
+    updatedAt: job?.updatedAt || null,
   };
 }
 
@@ -76,9 +91,8 @@ function inputFromBody(body) {
   };
 }
 
-async function runPipeline({ jobId, input, userId }) {
+async function runPipeline({ jobId, input, userId, io }) {
   let saved = null;
-  const io = input.io;
   try {
     emitStarted(io, userId, { jobId, status: "started", step: "Generating Lyrics", progress: 0 });
     updateProgress(io, userId, jobId, { status: "generating_lyrics", step: "Generating Lyrics", progress: 0 });
@@ -146,13 +160,14 @@ async function generateSong(req, res) {
   const input = inputFromBody(req.body);
   if (input.prompt.length < 2) return res.status(400).json({ error: "Prompt is required" });
   const jobId = crypto.randomBytes(10).toString("hex");
+  const io = req.app.get("io");
   setJob(jobId, { jobId, status: "queued", step: "Generating Lyrics", progress: 5, error: "", song: null, createdAt: Date.now() });
   if (req.query.wait === "true" || req.body.wait === true) {
-    const result = await runPipeline({ jobId, input: { ...input, io: req.app.get("io") }, userId: req.user._id });
+    const result = await runPipeline({ jobId, input, userId: req.user._id, io });
     if (result.status === "failed") return res.status(503).json({ error: result.error, jobId, song: result.song });
     return res.status(201).json(result.song);
   }
-  runPipeline({ jobId, input: { ...input, io: req.app.get("io") }, userId: req.user._id }).catch((err) => {
+  runPipeline({ jobId, input, userId: req.user._id, io }).catch((err) => {
     setJob(jobId, { status: "failed", step: "Failed", progress: 100, error: err.message });
   });
   res.status(202).json({ jobId, status: "queued", step: "Generating Lyrics", progress: 5 });
@@ -172,7 +187,7 @@ async function deleteGeneratedSong(req, res) {
 function getJob(req, res) {
   const job = jobs.get(req.params.jobId);
   if (!job) return res.status(404).json({ error: "Generation job not found" });
-  res.json(job);
+  res.json(publicJob(job));
 }
 
 async function generateInstrumentalEndpoint(req, res) {

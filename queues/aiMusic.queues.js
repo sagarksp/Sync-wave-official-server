@@ -18,7 +18,18 @@ const musicQueue = createQueue("musicQueue");
 const ttsQueue = createQueue("ttsQueue");
 const mergeQueue = createQueue("mergeQueue");
 
+function assertSerializableQueueData(name, data) {
+  try {
+    JSON.stringify(data);
+  } catch (err) {
+    const keys = data && typeof data === "object" ? Object.keys(data) : [];
+    console.error("[AI Queue] QUEUE_DATA_NOT_SERIALIZABLE", { name, keys, error: err.message });
+    throw new Error(`${name} received non-serializable job data`);
+  }
+}
+
 async function runStep(queue, name, data, handler) {
+  assertSerializableQueueData(name, data);
   if (!queue) return handler(data);
   const job = await queue.add(data, { removeOnComplete: true, removeOnFail: 50 });
   return new Promise((resolve, reject) => {

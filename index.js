@@ -35,6 +35,15 @@ function corsOrigin(origin, callback) {
 
 app.use(cors({ origin: corsOrigin, credentials: true }));
 app.use(express.json({ limit: "35mb" }));
+app.use((req, res, next) => {
+  const originalJson = res.json.bind(res);
+  res.json = (payload) => {
+    const keys = payload && typeof payload === "object" ? Object.keys(payload) : [];
+    console.log("RESPONSE_KEYS", { path: req.originalUrl, keys });
+    return originalJson(payload);
+  };
+  next();
+});
 
 const chatUploadDir = path.join(__dirname, "uploads", "chat");
 const generatedUploadDir = path.join(__dirname, "uploads", "generated");
@@ -423,6 +432,25 @@ function formatSong(s) {
   };
 }
 
+function safeSong(song) {
+  if (!song || typeof song !== "object") return null;
+  const streamUrl = String(song.streamUrl || song.audioUrl || song.mediaUrl || song.downloadUrl || "");
+  return {
+    id: String(song.id || song._id || "").slice(0, 120),
+    title: String(song.title || song.name || "Unknown").slice(0, 240),
+    artist: String(song.artist || song.artists || "Unknown").slice(0, 240),
+    album: String(song.album || "").slice(0, 240),
+    duration: Math.max(0, Number(song.duration) || 0),
+    cover: String(song.cover || song.coverImage || song.image || "").slice(0, 2000),
+    streamUrl: streamUrl.slice(0, 2000),
+    audioUrl: String(song.audioUrl || streamUrl).slice(0, 2000),
+    mediaUrl: String(song.mediaUrl || streamUrl).slice(0, 2000),
+    downloadUrl: String(song.downloadUrl || streamUrl).slice(0, 2000),
+    language: String(song.language || "").slice(0, 80),
+    year: String(song.year || "").slice(0, 20),
+  };
+}
+
 const sessions = {};
 
 function getOrCreateSession(accountId) {
@@ -482,6 +510,8 @@ function statePayload(session) {
     : "Idle";
   return {
     ...session.state,
+    currentSong: safeSong(session.state.currentSong),
+    queue: (Array.isArray(session.state.queue) ? session.state.queue : []).map(safeSong).filter(Boolean),
     position: getLivePosition(session),
     serverTime,
     devices: Object.values(session.devices).map((device) => ({
@@ -755,23 +785,24 @@ io.on("connection", (socket) => {
   });
 
   socket.on("play_song", ({ song }, ack) => {
-    console.log("play_song received", { deviceName: currentDeviceName, socketId: socket.id, song });
-    if (!currentAccountId || !song) {
+    const cleanSong = safeSong(song);
+    console.log("play_song received", { deviceName: currentDeviceName, socketId: socket.id, song: cleanSong });
+    if (!currentAccountId || !cleanSong) {
       ack?.({ ok: false, error: "Missing session or song" });
       return;
     }
     const session = sessions[currentAccountId];
     console.log("[SyncWave Player] play_song received", {
       deviceName: currentDeviceName,
-      songId: song.id,
-      title: song.title,
-      hasStreamUrl: Boolean(song.streamUrl),
+      songId: cleanSong.id,
+      title: cleanSong.title,
+      hasStreamUrl: Boolean(cleanSong.streamUrl),
       syncEnabled: session.state.syncEnabled,
     });
-    session.state.currentSong = song;
+    session.state.currentSong = cleanSong;
     setPlaybackCheckpoint(session, 0, true);
-    if (!session.state.queue.find((s) => s.id === song.id)) {
-      session.state.queue = [song, ...session.state.queue].slice(0, 100);
+    if (!session.state.queue.find((s) => s.id === cleanSong.id)) {
+      session.state.queue = [cleanSong, ...session.state.queue].slice(0, 100);
     }
     markStateAction(session, "SONG_CHANGE", currentDeviceId, currentDeviceName);
     console.log("[SyncWave Sync] STATE UPDATED", statePayload(session));
@@ -864,7 +895,7 @@ io.on("connection", (socket) => {
       return;
     }
     const session = sessions[currentAccountId];
-    session.state.queue = queue.filter(Boolean).slice(0, 100);
+    session.state.queue = queue.map(safeSong).filter(Boolean).slice(0, 100);
     markStateAction(session, "QUEUE", currentDeviceId, currentDeviceName);
     console.log("[SyncWave Sync] STATE UPDATED", statePayload(session));
     emitPlaybackState(socket, currentAccountId);
