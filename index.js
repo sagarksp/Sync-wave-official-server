@@ -475,6 +475,18 @@ function getOrCreateSession(accountId) {
         volume: 80,
         queue: [],
         syncEnabled: true,
+        discoverSync: {
+          enabled: false,
+          reelId: "",
+          index: 0,
+          position: 0,
+          isPlaying: true,
+          muted: true,
+          volume: 80,
+          speed: 1,
+          filter: "all",
+          updatedAt: 0,
+        },
         version: 0,
         lastAction: "INIT",
         lastActionId: 0,
@@ -931,6 +943,55 @@ io.on("connection", (socket) => {
     const session = sessions[currentAccountId];
     session.state.syncEnabled = Boolean(syncEnabled);
     emitState(currentAccountId);
+  });
+
+  socket.on("discover_sync_toggle", ({ enabled }, ack) => {
+    if (!currentAccountId) {
+      ack?.({ ok: false, error: "Missing session" });
+      return;
+    }
+    const session = sessions[currentAccountId];
+    session.state.discoverSync = {
+      ...(session.state.discoverSync || {}),
+      enabled: Boolean(enabled),
+      updatedAt: Date.now(),
+      updatedBy: currentDeviceId,
+      updatedByName: currentDeviceName,
+    };
+    console.log("[SyncWave Discover Sync] TOGGLE", { accountId: currentAccountId, enabled: session.state.discoverSync.enabled, deviceName: currentDeviceName });
+    io.to(currentAccountId).emit("discover_sync_update", { ...session.state.discoverSync, serverTime: Date.now() });
+    ack?.({ ok: true, discoverSync: session.state.discoverSync });
+  });
+
+  socket.on("discover_sync_update", (payload = {}, ack) => {
+    if (!currentAccountId) {
+      ack?.({ ok: false, error: "Missing session" });
+      return;
+    }
+    const session = sessions[currentAccountId];
+    const previous = session.state.discoverSync || {};
+    const enabled = payload.enabled !== undefined ? Boolean(payload.enabled) : Boolean(previous.enabled);
+    if (!enabled) {
+      ack?.({ ok: true, skipped: true });
+      return;
+    }
+    session.state.discoverSync = {
+      enabled,
+      reelId: String(payload.reelId || previous.reelId || "").slice(0, 120),
+      index: Math.max(0, Number(payload.index) || 0),
+      position: Math.max(0, Number(payload.position) || 0),
+      isPlaying: payload.isPlaying !== false,
+      muted: payload.muted !== false,
+      volume: Math.max(0, Math.min(100, Number(payload.volume ?? previous.volume ?? 80))),
+      speed: Math.max(0.25, Math.min(2, Number(payload.speed ?? previous.speed ?? 1))),
+      filter: String(payload.filter || previous.filter || "all").slice(0, 80),
+      updatedAt: Date.now(),
+      updatedBy: currentDeviceId,
+      updatedByName: currentDeviceName,
+    };
+    console.log("[SyncWave Discover Sync] UPDATE", { accountId: currentAccountId, deviceName: currentDeviceName, index: session.state.discoverSync.index, reelId: session.state.discoverSync.reelId, filter: session.state.discoverSync.filter });
+    socket.to(currentAccountId).emit("discover_sync_update", { ...session.state.discoverSync, serverTime: Date.now() });
+    ack?.({ ok: true, discoverSync: session.state.discoverSync });
   });
 
   socket.on("chat_message", async ({ message, encrypted, encryptedMessage, notificationPreview, attachments, replyTo } = {}, ack) => {
