@@ -1,0 +1,14 @@
+
+> syncwave-server@1.0.0 start D:\sagar\syncwave\server
+> node index.js
+
+SyncWave server running on :3001
+MongoDB connected
+RESPONSE_KEYS { path: '/api/discover/meta', keys: [ 'error' ] }
+RESPONSE_KEYS { path: '/api/auth/login', keys: [ 'error' ] }
+RESPONSE_KEYS { path: '/api/auth/login', keys: [ 'error' ] }
+RESPONSE_KEYS { path: '/api/auth/login', keys: [ 'error' ] }
+RESPONSE_KEYS { path: '/api/auth/login', keys: [ 'error' ] }
+RESPONSE_KEYS { path: '/api/auth/login', keys: [ 'error' ] }
+RESPONSE_KEYS { path: '/api/auth/login', keys: [ 'error' ] }
+RESPONSE_KEYS { path: '/api/auth/login', keys: [ 'error' ] }

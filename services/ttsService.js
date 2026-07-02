@@ -54,6 +54,7 @@ async function synthesizeVocals({ lyrics, language, voice, voiceType, jobId }) {
     text,
     language: languageCode(language),
     voice: String(voice || voiceType || "male").toLowerCase(),
+    speaker: String(voice || voiceType || "male").toLowerCase(),
   };
 
   const meloUrl = cleanBaseUrl(process.env.MELOTTS_WORKER_URL);
@@ -61,7 +62,7 @@ async function synthesizeVocals({ lyrics, language, voice, voiceType, jobId }) {
 
   if (meloUrl) {
     try {
-      const audioUrl = await callWorker(meloUrl, "/tts/melo", payload);
+      const audioUrl = await callWorker(meloUrl, "/generate", payload);
       return downloadWorkerAudio(meloUrl, audioUrl, jobId, "melo");
     } catch (err) {
       if (!coquiUrl) throw err;
@@ -70,7 +71,7 @@ async function synthesizeVocals({ lyrics, language, voice, voiceType, jobId }) {
   }
 
   if (coquiUrl) {
-    const audioUrl = await callWorker(coquiUrl, "/tts/coqui", payload);
+    const audioUrl = await callWorker(coquiUrl, "/generate", payload);
     return downloadWorkerAudio(coquiUrl, audioUrl, jobId, "coqui");
   }
 

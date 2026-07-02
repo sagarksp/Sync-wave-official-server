@@ -16,6 +16,10 @@ const Playlist = require("./models/Playlist");
 const { authRequired, signToken, JWT_SECRET } = require("./middleware/auth");
 const aiMusicRoutes = require("./routes/aiMusic");
 const ttsRoutes = require("./routes/tts.routes");
+const gamesRoutes = require("./routes/games");
+const discoverRoutes = require("./routes/discover");
+const { registerGamesSocket } = require("./socket/games");
+const { ensureUploadRoot, uploadRoot: discoverReelUploadDir } = require("./services/discover/videoUpload.service");
 
 const app = express();
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "*";
@@ -49,11 +53,16 @@ const chatUploadDir = path.join(__dirname, "uploads", "chat");
 const generatedUploadDir = path.join(__dirname, "uploads", "generated");
 fs.mkdirSync(chatUploadDir, { recursive: true });
 fs.mkdirSync(generatedUploadDir, { recursive: true });
+ensureUploadRoot();
 app.use("/chat-uploads", express.static(chatUploadDir, {
   immutable: true,
   maxAge: "30d",
 }));
 app.use("/generated", express.static(generatedUploadDir, {
+  immutable: true,
+  maxAge: "30d",
+}));
+app.use("/discover-reels", express.static(discoverReelUploadDir, {
   immutable: true,
   maxAge: "30d",
 }));
@@ -219,6 +228,8 @@ app.post("/api/chat/attachments", authRequired, async (req, res) => {
 
 app.use("/api/ai", aiMusicRoutes);
 app.use("/api/tts", ttsRoutes);
+app.use("/api/games", gamesRoutes);
+app.use("/api/discover", discoverRoutes);
 
 function publicPlaylist(playlist) {
   return {
@@ -1240,6 +1251,8 @@ io.on("connection", (socket) => {
     emitDeviceEvent(currentAccountId, "leave", currentDeviceName || "Unknown Device");
   });
 });
+
+registerGamesSocket(io);
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
