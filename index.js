@@ -365,8 +365,13 @@ app.get("/api/download/proxy", authRequired, async (req, res) => {
     const response = await fetch(rawUrl, { headers: { "User-Agent": "SyncWave/1.0" } });
     if (!response.ok) return res.status(response.status).json({ error: "Download source failed" });
 
-    const filename = `syncwave-${String(req.query.songId || "song").replace(/[^a-z0-9_-]/gi, "") || "song"}.mp3`;
-    res.setHeader("Content-Type", response.headers.get("content-type") || "audio/mpeg");
+    const contentType = response.headers.get("content-type") || "audio/mpeg";
+    const pathname = parsed.pathname.toLowerCase();
+    const urlExt = (pathname.match(/\.([a-z0-9]{2,5})$/i) || [])[1];
+    const typeExt = contentType.includes("mp4") ? "mp4" : contentType.includes("m4a") || contentType.includes("aac") ? "m4a" : "mp3";
+    const ext = ["mp3", "m4a", "mp4", "aac", "wav", "webm"].includes(urlExt) ? urlExt : typeExt;
+    const filename = `syncwave-${String(req.query.songId || "song").replace(/[^a-z0-9_-]/gi, "") || "song"}.${ext}`;
+    res.setHeader("Content-Type", contentType);
     const contentLength = response.headers.get("content-length");
     if (contentLength) res.setHeader("Content-Length", contentLength);
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
